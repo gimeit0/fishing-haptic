@@ -1,3 +1,5 @@
+
+
 // =============================================================================
 //  疑似釣り体験プロトタイプ  ―  完全钓鱼体验シミュレータ (単体デモ版)
 //  Fishing Experience Simulator  ―  runs on a single M5StickS3
@@ -28,6 +30,7 @@
 
 #include <M5Unified.h>
 #include <math.h>
+#include "haptics.h"   // I2S → MAX98357A → 加振器 触覚提示 (研究計画書 3.2)
 
 // ===== 状態定義 / State machine =====
 enum State {
@@ -52,7 +55,8 @@ static const char* stateName(State s) {
 #define CAST_MS          1000     // 投竿アニメ時間
 #define WAIT_MIN_MS      3000     // 待ち時間 下限
 #define WAIT_MAX_MS      8000     // 待ち時間 上限
-#define NIBBLE_MS        1500     // 前アタリ持続
+#define NIBBLE_MIN_MS    3500     // 前アタリ持続 下限 (バースト4個以上を体感させる)
+#define NIBBLE_MAX_MS    6000     // 同 上限 (毎回ランダム。BITE の到来を予測不能に)
 #define BITE_WINDOW_MS   1000     // 合わせ猶予 (この間にジャーク)
 #define CAUGHT_MS        3000     // 釣果表示
 #define FAILED_MS        2000     // 失敗表示
@@ -69,19 +73,39 @@ static const char* stateName(State s) {
 #define ROD_START        50.0f    // マーカー初期位置 0-100 (ゾーン中央)
 #define ZONE_LO          32.0f    // スイートゾーン下限(左の赤線) ※横バー
 #define ZONE_HI          72.0f    // スイートゾーン上限(右の赤線) ※幅40に拡大
-#define PUMP_RISE        16.0f    // 1回の上提でマーカーが進む量
+#define PUMP_RISE        20.0f    // 1回の上提でマーカーが進む量 (長期戦向けに約1回/秒で維持可能に)
 #define DRIFT_MIN        12.0f    // 通常の引き(減衰) 下限 [/秒] ※反応しやすく緩和
 #define DRIFT_MAX        30.0f    // 通常の引き(減衰) 上限 [/秒]
 #define DRIFT_SURGE      52.0f    // 突進(サージ)時の減衰 [/秒]
 #define SURGE_CHANCE     10       // 再抽選毎にサージへ入る確率 [%]
+#define DRIFT_REST       4.0f     // 休息(魚が引きを緩める)時の減衰 [/秒]
+#define REST_CHANCE      18       // 再抽選毎に休息へ入る確率 [%]
 #define DRIFT_REROLL_MIN 550      // 減衰速度の再抽選間隔 下限 [ms]
 #define DRIFT_REROLL_MAX 1100     // 同 上限 [ms]
-#define HOLD_TARGET_MIN  3000     // 捕獲に必要な"ゾーン維持"累計時間 下限 [ms]
-#define HOLD_TARGET_MAX  5000     // 同 上限 [ms] (毎回ランダム)
-#define ESCAPE_LIMIT     2200     // ゾーン外が連続このmsを超えるとバラし
+#define HOLD_TARGET_MIN  12000    // 捕獲に必要な"ゾーン維持"累計時間 下限 [ms]
+#define HOLD_TARGET_MAX  18000    // 同 上限 [ms] (毎回ランダム)
+                                  //   ※実測の全程体感は20-30秒。Sea of Thieves(通常魚~45秒)と
+                                  //     Stardew Valley(~10-20秒)の中間を狙った値。
+#define ESCAPE_LIMIT     3000     // ゾーン外が連続このmsを超えるとバラし (長期戦化に伴い緩和)
+// 魚の疲労(burst-and-coast): 進度が上がるほど突進が減り休息が増える。
+//   Bainbridge1958 [高椋論文の引用文献17]: 遊泳速度は尾振り「頻度」で決まり、
+//   振幅は5Hz以上でほぼ一定。よって疲労は「爆発の頻度・密度の低下」として現れる
+//   (振幅を均一に下げるのではなく、挙動をまばらにする)。触覚振幅は driftPerSec
+//   由来なので、頻度が落ちれば手の感覚も自然に弱く・まばらになる。
+//   ※実験で変数を切り分けたい時は両定数を0にすれば疲労弧線が消える。
+#define FATIGUE_SURGE_FADE 0.7f   // 進度100%で突進確率が(1-0.7)=30%に減る (10%→約3%)
+#define FATIGUE_REST_GAIN  20     // 進度100%で休息確率が+この値[%] (18%→約38%)
 #define PUMP_GYRO_FIRE   160.0f   // 上提検出: 角速度[deg/s] 立ち上がり閾値
 #define PUMP_GYRO_ARM    70.0f    // 角速度がこれ未満に戻ると次の上提を再武装
 #define PUMP_REFRACT_MS  130      // 連続検出の不応期 [ms]
+
+// ===== 触覚提示のマッピング / Haptic mapping =====
+//   引き感 (高椋ら 2016): 振幅=引きの強さ, パルス間隔T=粗さ(暴れ感)。
+//   ゲーム側の魚の引き driftPerSec と連動させ、サージ時は強く粗い引きにする。
+#define PULL_STR_MIN     0.45f    // 通常の引きの最小振幅 (0..1)
+#define PULL_STR_MAX     1.00f    // サージ時の振幅
+#define PULL_T_SLOW      22       // 弱い引きのパルス間隔 [ms] (細かい振動)
+#define PULL_T_FAST      12       // 強い引きのパルス間隔 [ms] (粗い振動, ≥12ms 推奨域)
 
 // ===== 釣果テーブル / Catch table =====
 static const char* FISH[] = { "Bass 23cm", "Trout 31cm", "Carp 45cm", "Perch 18cm" };
@@ -91,9 +115,10 @@ static const int   NUM_FISH = sizeof(FISH) / sizeof(FISH[0]);
 State        state        = IDLE;
 uint32_t     stateStart   = 0;       // 現状態に入った時刻
 uint32_t     waitMs       = 0;       // WAITING のランダム待ち時間
+uint32_t     nibbleMs     = 4500;    // NIBBLE のランダム持続時間
 float        rodPos       = ROD_START;      // FIGHTING: マーカー位置 0-100
 uint32_t     holdTime     = 0;              // ゾーン内維持の累計 [ms]
-uint32_t     holdTarget   = 4000;           // 捕獲に必要な維持時間 (enterで乱数)
+uint32_t     holdTarget   = 15000;          // 捕獲に必要な維持時間 (enterで乱数)
 uint32_t     escapeTime   = 0;              // ゾーン外の連続時間 [ms]
 float        driftPerSec  = 28.0f;          // 現在の下方減衰速度 [/秒]
 uint32_t     driftReroll  = 0;              // 次に減衰を再抽選する時刻
@@ -105,6 +130,12 @@ int          caughtIdx    = 0;
 const char*  failReason   = "";
 int          runCount      = 0;       // 何回目のキャスト (会话编号)
 bool         imuOk        = false;
+
+// ===== 触覚チューニング (シリアルコマンドで調整, 予備評価用) =====
+float hapPullScale   = 1.0f;   // 引き振幅の全体スケール ("pa 0.8")
+int   hapPullTOverride = 0;    // >0 ならパルス間隔T を固定 [ms] ("pt 17", 0=自動)
+int   hapTestMode    = -1;     // -1=ゲーム連動, それ以外は HapticMode を強制 ("t p" 等)
+bool  hapIrregular   = true;   // 不規則性 on/off ("ir 0|1")。off=高椋ら準拠の規則刺激(対照条件)
 
 // 描画ターゲット (オフスクリーン) / Off-screen render target
 M5Canvas canvas(&M5.Display);
@@ -163,6 +194,7 @@ void logState() {
                 (unsigned long)millis(), stateName(state), runCount);
   switch (state) {
     case WAITING:  Serial.printf("  waitMs=%lu", (unsigned long)waitMs); break;
+    case NIBBLE:   Serial.printf("  nibbleMs=%lu", (unsigned long)nibbleMs); break;
     case FIGHTING: Serial.printf("  holdTarget=%lu ms", (unsigned long)holdTarget); break;
     case CAUGHT:   Serial.printf("  fish=%s", FISH[caughtIdx]);         break;
     case FAILED:   Serial.printf("  reason=%s", failReason);            break;
@@ -179,6 +211,7 @@ void enterState(State s) {
   switch (s) {
     case CASTING:  MEL(SFX_CAST); break;                                          // 嗖
     case WAITING:  waitMs = random(WAIT_MIN_MS, WAIT_MAX_MS + 1); MEL(SFX_PLOP); break; // 扑通
+    case NIBBLE:   nibbleMs = random(NIBBLE_MIN_MS, NIBBLE_MAX_MS + 1); break;
     case FIGHTING:                                                                // 叮咚↗
       rodPos = ROD_START; holdTime = 0; escapeTime = 0;
       holdTarget  = random(HOLD_TARGET_MIN, HOLD_TARGET_MAX + 1);
@@ -384,6 +417,13 @@ void renderScene() {
       const char* hint = inZone ? "HOLD !" : (rodPos < ZONE_LO ? "PUMP UP ->" : "<- ease off");
       textC(hint, W / 2, barY + barH + 8, 1, inZone ? GREEN : ORANGE);
 
+      // 触覚刺激の現在値 (振幅% / パルス間隔T) ― 実験時の条件確認用
+      if (hapticReady()) {
+        snprintf(b, sizeof(b), "A:%d%% T:%dms",
+                 (int)roundf(hapticPullStrength() * 100), hapticPullInterval());
+        textC(b, W / 2, barY + barH + 20, 1, SKYBLUE);
+      }
+
       shakeX = random(-2, 3);
       if (flash) shakeY = -3;                              // 上提でクッと
       break;
@@ -432,7 +472,7 @@ void updateLogic() {
     case NIBBLE:
       // 魚が餌を突く"嘀…嘀…"ティック / soft nibble ticks
       if (millis() - sfxTick >= 280) { beep(2200, 22); sfxTick = millis(); }
-      if (el >= NIBBLE_MS) enterState(BITE);
+      if (el >= nibbleMs) enterState(BITE);
       break;
 
     case BITE: {
@@ -462,9 +502,18 @@ void updateLogic() {
       if (dt > 100) dt = 100;                            // 取りこぼし時のクランプ
 
       // --- 魚の引き(下方減衰)をランダムに再抽選 / re-roll random drift ---
+      //   突進(強く粗い引き) / 休息(引きが緩む) / 通常 の3態。触覚振幅も
+      //   この driftPerSec から導くため、画面と手の感覚が常に一致する。
       if (now >= driftReroll) {
-        if ((int)random(0, 100) < SURGE_CHANCE) driftPerSec = DRIFT_SURGE;   // 突進
-        else driftPerSec = random((int)DRIFT_MIN, (int)DRIFT_MAX + 1);
+        // 疲労で「行動」を変える: 進むほど突進が稀になり休息が増える(burst-and-coast)。
+        // 単発振幅は変えないので、突発的な引きの峰は終盤まで残る。
+        float progress = (float)holdTime / holdTarget; if (progress > 1) progress = 1;
+        int surgeCh = (int)(SURGE_CHANCE * (1.0f - FATIGUE_SURGE_FADE * progress)); // 10→約3%
+        int restCh  = REST_CHANCE + (int)(FATIGUE_REST_GAIN * progress);            // 18→約38%
+        int roll = (int)random(0, 100);
+        if      (roll < surgeCh)          driftPerSec = DRIFT_SURGE;  // 突進(終盤は稀)
+        else if (roll < surgeCh + restCh) driftPerSec = DRIFT_REST;   // 休息(終盤は頻繁)
+        else driftPerSec = random((int)DRIFT_MIN, (int)DRIFT_MAX + 1); // 通常
         driftReroll = now + random(DRIFT_REROLL_MIN, DRIFT_REROLL_MAX + 1);
       }
       rodPos -= driftPerSec * dt / 1000.0f;              // マーカーは下へ
@@ -523,6 +572,103 @@ void updateLogic() {
 }
 
 // =============================================================================
+//  触覚提示の更新 / Haptic update  (研究計画書 3.2-3.3 の刺激設計)
+//   NIBBLE/BITE → アタリ振動 (10+23Hz),  FIGHTING → 非対称矩形波 (引き感)
+// =============================================================================
+void updateHaptics() {
+  float strength;
+  int   Tms;
+
+  if (hapIrregular) {
+    // ＝＝ 不規則モード: 魚行動×張力の2層モデル ＝＝
+    // [魚行動層] driftPerSec (突進52/通常12-30/休息4) → 振幅の土台。
+    //   画面のマーカー減衰と同じ値なので視覚と触覚が必ず一致する。
+    float s01 = driftPerSec / DRIFT_SURGE;
+    if (s01 < 0.12f) s01 = 0.12f;                    // 休息中もライン張力は残る
+    if (s01 > 1.0f)  s01 = 1.0f;
+
+    // [張力層1] 竿の姿勢: 竿を立てている(マーカー高)ほど張力大 ×0.85-1.15
+    float posFac = 0.85f + 0.30f * (rodPos / 100.0f);
+
+    // [張力層2] 上提の瞬間: pump 直後 400ms は最大+35%の張力スパイク
+    uint32_t dtP = millis() - lastPumpAt;
+    float pumpFac = (state == FIGHTING && lastPumpAt != 0 && dtP < 400)
+                  ? 1.0f + 0.35f * (1.0f - dtP / 400.0f) : 1.0f;
+
+    strength = s01 * posFac * pumpFac * hapPullScale;
+
+    // パルス間隔T: 引きが強いほど粗く(22→12ms)。休息中は細かく弱い振動。
+    float k = (driftPerSec - DRIFT_MIN) / (DRIFT_SURGE - DRIFT_MIN);
+    if (k < 0) k = 0; if (k > 1) k = 1;
+    Tms = hapPullTOverride > 0
+        ? hapPullTOverride
+        : (int)roundf(PULL_T_SLOW - k * (PULL_T_SLOW - PULL_T_FAST));
+  } else {
+    // ＝＝ 規則モード(対照条件): 高椋ら2016と同じ一定振幅・一定間隔 ＝＝
+    strength = 0.7f * hapPullScale;
+    Tms = hapPullTOverride > 0 ? hapPullTOverride : PULL_T_SLOW - (PULL_T_SLOW - PULL_T_FAST) / 2;
+  }
+  hapticSetIrregular(hapIrregular);
+  hapticSetPull(strength, Tms);
+
+  if (hapTestMode >= 0) {                    // シリアルからの強制モード (ベンチ試験)
+    hapticSetMode((HapticMode)hapTestMode);
+    return;
+  }
+  switch (state) {                           // ゲーム状態 → 提示モード
+    case NIBBLE:   hapticSetMode(HAPTIC_NIBBLE); break;
+    case BITE:     hapticSetMode(HAPTIC_BITE);   break;
+    case FIGHTING: hapticSetMode(HAPTIC_PULL);   break;
+    default:       hapticSetMode(HAPTIC_OFF);    break;
+  }
+}
+
+// =============================================================================
+//  シリアルコマンド / Serial tuning commands (予備評価でのパラメータ探索用)
+//    t 0|n|b|p  : 触覚モードを強制 (off/nibble/bite/pull)   t g : ゲーム連動へ戻す
+//    pa <0-1>   : 引き振幅スケール      pt <ms> : パルス間隔T固定 (pt 0 で自動)
+//    na <0-1>   : アタリ振幅
+// =============================================================================
+void handleCommand(char* line) {
+  char cmd = line[0];
+  char* arg = line[1] ? line + 2 : (char*)"";
+  switch (cmd) {
+    case 't':
+      if      (arg[0] == '0') hapTestMode = HAPTIC_OFF;
+      else if (arg[0] == 'n') hapTestMode = HAPTIC_NIBBLE;
+      else if (arg[0] == 'b') hapTestMode = HAPTIC_BITE;
+      else if (arg[0] == 'p') hapTestMode = HAPTIC_PULL;
+      else                    hapTestMode = -1;          // 't g' などはゲーム連動
+      Serial.printf("  haptic test mode = %d (-1=game)\n", hapTestMode);
+      break;
+    case 'p':
+      if (line[1] == 'a') { hapPullScale = atof(arg); Serial.printf("  pull scale = %.2f\n", hapPullScale); }
+      if (line[1] == 't') { hapPullTOverride = atoi(arg); Serial.printf("  pull T = %d ms (0=auto)\n", hapPullTOverride); }
+      break;
+    case 'n':
+      if (line[1] == 'a') { hapticSetNibbleAmp(atof(arg)); Serial.printf("  nibble amp = %.2f\n", hapticNibbleAmp()); }
+      break;
+    case 'i':
+      if (line[1] == 'r') {
+        hapIrregular = (atoi(arg) != 0);
+        Serial.printf("  irregularity = %s\n", hapIrregular ? "ON (fish model)" : "OFF (regular, Takamuku-style)");
+      }
+      break;
+    default:
+      Serial.println("  cmds: t 0|n|b|p|g / pa <0-1> / pt <ms> / na <0-1> / ir 0|1");
+  }
+}
+
+void pollSerial() {
+  static char line[24]; static int len = 0;
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') { line[len] = 0; if (len) handleCommand(line); len = 0; }
+    else if (len < (int)sizeof(line) - 1) line[len++] = c;
+  }
+}
+
+// =============================================================================
 //  setup / loop
 // =============================================================================
 void setup() {
@@ -531,7 +677,7 @@ void setup() {
   M5.begin(cfg);
   Serial.begin(115200);
 
-  M5.Display.setRotation(1);
+  M5.Display.setRotation(0);                // 逆时针 90° (旧: 1)
   M5.Display.setBrightness(255);            // 最亮 / max brightness
   W = M5.Display.width();
   H = M5.Display.height();
@@ -561,19 +707,29 @@ void setup() {
 
   randomSeed(esp_random());
 
-  Serial.println("=== Fishing Experience Simulator (single-device demo) ===");
-  Serial.printf("Display %dx%d  sprite=%s  IMU=%s  SPK=%s\n",
+  // I2S 触覚出力 (MAX98357A)。配線が無くても失敗せず、デモは継続する。
+  bool hapOk = hapticInit();
+
+  Serial.println("=== Fishing Experience Simulator + Haptics ===");
+  Serial.printf("Display %dx%d  sprite=%s  IMU=%s  SPK=%s  I2S=%s\n",
                 W, H, useSprite ? "on" : "off",
-                imuOk ? "ok" : "N/A", speakerOk ? "ok" : "N/A");
+                imuOk ? "ok" : "N/A", speakerOk ? "ok" : "N/A",
+                hapOk ? "ok" : "N/A");
+  Serial.println("serial cmds: t 0|n|b|p|g / pa <0-1> / pt <ms> / na <0-1> / ir 0|1");
 
   enterState(IDLE);
 }
 
 void loop() {
   M5.update();
+  pollSerial();                             // 触覚チューニングコマンド
   updateLogic();
+  updateHaptics();                          // 状態→触覚刺激のマッピング
   updateMelody();                           // ジングルを1ノートずつ進める
   renderScene();
   present();
   delay(16);                                // ~60fps
 }
+
+
+
