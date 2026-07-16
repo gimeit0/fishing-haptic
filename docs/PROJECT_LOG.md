@@ -74,6 +74,8 @@ IDLE → CASTING → WAITING → NIBBLE →（BITE 窗口内合わせ）→ FIGH
 
 - 调研牵引力错觉（CHI 2025 motion-coupled、Sensors 2020 40Hz 最优）、真实竿振动实测（NAIST 鱼种判别等）、包络调制渲染、音触一致性等文献。
 - 提出 5 条改进方案：① AM 载波绕过 14Hz 高通/加振器共振限制 ② アタリ瞬态化（敲击+竿体余振）③ 运动耦合非对称振动引き感 ④ FIGHTING 双层渲染（张力纹理+事件词汇表）⑤ 音触同步+IMU 实录校准。
+- 新增 `docs/先行研究.md`：整理该领域主要研究团队（雨宮研/NTT、sensint@MPI-INF、Kuchenbecker@MPI-IS、Culbertson@USC、Choi@POSTECH、梶本研等）及其与五条方案的对应关系。
+- 新增 `docs/雨宫.md`：调研雨宮智浩（東大）全部研究（178 篇），筛出可应用于本设备的技术并分 A/B/C 三类汇总；发现"弱侧低于知觉阈值"定标准则、重量感错觉（ToH 2008）等可直接落地项。
 - 仅文档，未改代码。
 
 ### 2026-07-08 — 游戏手感调参 + 触觉联动完成（main.cpp）
