@@ -70,6 +70,12 @@ IDLE → CASTING → WAITING → NIBBLE →（BITE 窗口内合わせ）→ FIGH
 
 ## 改动日志
 
+### 2026-07-16 — 文献调研 + 真实感改进方案书（docs/IMPROVEMENT_PROPOSAL.md 新建）
+
+- 调研牵引力错觉（CHI 2025 motion-coupled、Sensors 2020 40Hz 最优）、真实竿振动实测（NAIST 鱼种判别等）、包络调制渲染、音触一致性等文献。
+- 提出 5 条改进方案：① AM 载波绕过 14Hz 高通/加振器共振限制 ② アタリ瞬态化（敲击+竿体余振）③ 运动耦合非对称振动引き感 ④ FIGHTING 双层渲染（张力纹理+事件词汇表）⑤ 音触同步+IMU 实录校准。
+- 仅文档，未改代码。
+
 ### 2026-07-08 — 游戏手感调参 + 触觉联动完成（main.cpp）
 
 - **引き感与游戏联动**：FIGHTING 中按 `driftPerSec` 映射振幅（PULL_STR 0.45–1.0）和脉冲间隔（PULL_T 22–12ms），突进时更强更粗糙。
