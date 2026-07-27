@@ -24,11 +24,16 @@
 
 // ===== 刺激デフォルト =====
 #define PULL_HIGH_MS       5        // 非対称矩形波の高電圧区間 (高椋ら: 固定5ms)
-#define PULL_INTERVAL_DEF  17       // パルス間隔T の既定値 [ms] (12ms以上を推奨)
+#define PULL_INTERVAL_DEF  20       // パルス間隔T の既定値 [ms]。周期 5+20=25ms ≈ 40Hz
+                                    // (Tanaka ら 2020: 非対称振動の牽引錯覚は 40Hz 付近が最適)
 #define PULL_POLARITY      (+1.0f)  // 牽引方向。取付向きに合わせ ±1 で反転可
 #define NIBBLE_AMP_DEF     0.55f    // アタリ振幅。才木らの主旨は「手元で知覚できない
                                     // アタリの増幅提示」なので、知覚しやすい水準を既定にする。
                                     // 知覚閾の探索実験では "na" コマンドで下げて調整。
+#define CARRIER_HZ_DEF     60.0f    // AM キャリア既定値 [Hz]。EX25FHE2-4 の共振点想定
+                                    // (50–80Hz)。実機で "fc" スイープして決める。
+#define TAP_CLICK_MS       3        // タップ冒頭クリック幅 (2–5ms の短促冲击)
+#define TAP_TAU_DEF        120      // タップ余振の減衰時定数 τ 既定値 [ms]
 #define MASTER_GAIN        0.90f    // クリップ余裕
 
 // ===== loop() 側から書かれる共有パラメータ (単語アクセスなので volatile で足りる) =====
@@ -37,28 +42,46 @@ static volatile float   s_pullStrength = 0.7f;
 static volatile int     s_pullT        = PULL_INTERVAL_DEF;
 static volatile float   s_nibbleAmp    = NIBBLE_AMP_DEF;
 static volatile bool    s_irregular    = true;
+static volatile float   s_carrierHz    = CARRIER_HZ_DEF;
+static volatile int     s_tapTau       = TAP_TAU_DEF;
+static volatile int     s_slackReq     = 0;   // >0: PULL を ms だけ骤停 (方案四)
+static volatile float   s_tapReq       = 0;   // >0: PULL にタップを1回重畳
 static bool             s_ready        = false;
 
 // ===== タスク内 合成状態 =====
-static float  ph10 = 0, ph23 = 0;     // アタリ正弦波の位相
+static float  ph10 = 0, ph23 = 0;     // アタリ包絡 (10/23Hz) の位相
+static float  phC  = 0;               // AM キャリアの位相
 static int    pullPos = 0;            // 非対称波 1周期内のサンプル位置
 static float  lfoPh   = 0;            // 引きの"暴れ"用 低周波ゆらぎ位相
 static float  masterEnv = 0;          // モード切替クロスフェード用 0..1
 static uint8_t modeApplied = HAPTIC_OFF;
-// アタリのバースト管理 (サンプル数でカウント)
+// 旧アタリ(対照条件)のバースト管理 (サンプル数でカウント)
 static int    burstLeft = 0, gapLeft = 0;
 static float  burstEnv  = 0;          // バースト内エンベロープ (クリック防止)
+// タップイベント (方案二) の状態
+static int    tapPos = -1;            // -1 = 停止中
+static int    tapClickLen = 0;
+static float  tapAmp = 0, tapDecay = 1, tapK = 1;
+static int    tapNextIn = 0;          // 次タップまでのサンプル数 (スケジューラ)
+static float  biteRamp = 0;           // BITE の漸強 0..1
+// PULL のイベント状態 (方案四)
+static int    slackLeft = 0;          // 骤停の残りサンプル数
+static float  slackEnv  = 1;          // 骤停用エンベロープ (クリック防止)
 
 static inline int msToSamples(int ms) { return ms * HAP_RATE / 1000; }
 static inline int rnd(int lo, int hi) { return lo + (int)(esp_random() % (uint32_t)(hi - lo + 1)); }
 
-// --- アタリ 1サンプル: 10Hz + 23Hz 合成 (才木ら 2016 の周波数ピークに基づく) ---
-//     ※ MAX98357A 内蔵の ~14Hz HPF で 10Hz 成分は減衰するため若干重み付けする
-static float nibbleSample(float amp, bool continuous) {
-  const float W10 = 2.0f * PI * 10.0f / HAP_RATE;
-  const float W23 = 2.0f * PI * 23.0f / HAP_RATE;
-  ph10 += W10; if (ph10 > 2 * PI) ph10 -= 2 * PI;
-  ph23 += W23; if (ph23 > 2 * PI) ph23 -= 2 * PI;
+// --- 位相更新: 10/23Hz 包絡とキャリアは全モード共通で回し続ける ---
+static inline void advancePhases() {
+  ph10 += 2.0f * PI * 10.0f / HAP_RATE; if (ph10 > 2 * PI) ph10 -= 2 * PI;
+  ph23 += 2.0f * PI * 23.0f / HAP_RATE; if (ph23 > 2 * PI) ph23 -= 2 * PI;
+  phC  += 2.0f * PI * s_carrierHz / HAP_RATE; if (phC > 2 * PI) phC -= 2 * PI;
+}
+
+// --- 対照条件アタリ 1サンプル: 10Hz + 23Hz 合成正弦の直接出力 (才木ら 2016 準拠) ---
+//     ※ MAX98357A の ~14Hz HPF と加振器共振 (Fs≈50–60Hz) で大きく減衰する。
+//       改良版 (タップ+AM) との対比実験用に残してある。
+static float nibbleLegacySample(float amp, bool continuous) {
   float s = 0.58f * sinf(ph10) + 0.42f * sinf(ph23);
 
   if (continuous) return s * amp;     // BITE: 連続提示
@@ -74,6 +97,54 @@ static float nibbleSample(float amp, bool continuous) {
   // 15ms 程度のアタック/リリース (1/(0.015*16000) ≈ 0.004)
   burstEnv += (target - burstEnv) * 0.004f * 8.0f;
   return s * amp * burstEnv;
+}
+
+// --- タップイベント: 短促クリック + 指数減衰する AM 余振 (方案一+二) ---
+//     クリック (3ms 半正弦) が「竿を叩かれた」瞬態、その後
+//     e^(-t/τ) × [10+23Hz 包絡] × sin(2π·fc·t) が竿体の余振。
+//     低域はキャリア fc の包絡として表現するので、アンプの ~14Hz HPF と
+//     加振器の共振特性 (Fs 以下急減衰) を回避して"手に届く"。
+static void tapStart(float amp, int tauMs) {
+  tapClickLen = msToSamples(TAP_CLICK_MS);
+  int tauSamples = msToSamples(tauMs < 30 ? 30 : tauMs);
+  tapK     = expf(-1.0f / (float)tauSamples);
+  tapDecay = 1.0f;
+  tapAmp   = amp;
+  tapPos   = 0;
+}
+
+static float tapSample() {
+  if (tapPos < 0) return 0;
+  float v;
+  if (tapPos < tapClickLen) {
+    v = sinf(PI * tapPos / (float)tapClickLen);           // クリック: 半正弦パルス
+  } else {
+    tapDecay *= tapK;
+    if (tapDecay < 0.02f) { tapPos = -1; return 0; }      // ~4τ で終了
+    float envLow = 0.5f + 0.5f * (0.58f * sinf(ph10) + 0.42f * sinf(ph23));
+    v = tapDecay * envLow * sinf(phC);                    // AM 余振
+  }
+  tapPos++;
+  return tapAmp * v;
+}
+
+// --- 改良版アタリ: タップイベント列のスケジューラ (方案二) ---
+//     NIBBLE = 稀疏な単発「コツッ」(30% で二連打),
+//     BITE   = 密な連打「ココココッ」+ 幅度漸強。
+static void nibbleTapSchedule(float amp, bool bite) {
+  if (tapNextIn > 0) { tapNextIn--; return; }
+  int tau = s_tapTau;
+  if (bite) {
+    biteRamp += 0.08f; if (biteRamp > 1) biteRamp = 1;
+    // 連打はやや短い余振で歯切れよく。振幅は 60%→100% へ漸強 + 少しばらつき
+    tapStart(amp * (0.60f + 0.40f * biteRamp) * (0.85f + 0.15f * (rnd(0, 100) / 100.0f)),
+             rnd(tau / 2, tau * 3 / 4));
+    tapNextIn = msToSamples(rnd(70, 140));
+  } else {
+    tapStart(amp * (0.80f + 0.20f * (rnd(0, 100) / 100.0f)), rnd(tau * 3 / 4, tau * 5 / 4));
+    // 30% で「コツコツッ」の二連打、それ以外は 350–900ms 空ける
+    tapNextIn = msToSamples(rnd(0, 99) < 30 ? rnd(90, 150) : rnd(350, 900));
+  }
 }
 
 // --- 引き 1サンプル: 5ms 高電圧 + T ms 低電圧 の非対称矩形波 (高椋ら 2016) ---
@@ -117,21 +188,48 @@ static void hapticTask(void*) {
     int     pT   = s_pullT;
     float   nAmp = s_nibbleAmp;
 
+    // PULL 中のイベント要求を取り込む (方案四)。他モードでは破棄。
+    if (modeApplied == HAPTIC_PULL) {
+      if (s_slackReq > 0) { slackLeft = msToSamples(s_slackReq); s_slackReq = 0; }
+      if (s_tapReq   > 0) { tapStart(s_tapReq, rnd(60, 100));    s_tapReq   = 0; }
+    } else {
+      s_slackReq = 0; s_tapReq = 0;
+    }
+
     for (int i = 0; i < HAP_CHUNK; i++) {
       // モード切替はクロスフェード: 一旦 0 まで落としてから切替 (ポップ音防止)
       float envTarget = (modeApplied == want) ? 1.0f : 0.0f;
       masterEnv += (envTarget - masterEnv) * 0.02f;      // ≈3ms 時定数
       if (modeApplied != want && masterEnv < 0.02f) {
         modeApplied = want;
-        ph10 = ph23 = lfoPh = 0; pullPos = 0;
+        ph10 = ph23 = phC = lfoPh = 0; pullPos = 0;
         burstLeft = gapLeft = 0; burstEnv = 0;
+        tapPos = -1; tapNextIn = 0; biteRamp = 0;
+        slackLeft = 0; slackEnv = 1;
       }
+      advancePhases();
       float s = 0;
       switch (modeApplied) {
-        case HAPTIC_NIBBLE: s = nibbleSample(nAmp, false); break;
-        case HAPTIC_BITE:   s = nibbleSample(fminf(1.0f, nAmp * 2.2f), true); break;
-        case HAPTIC_PULL:   s = pullSample(pStr, pT); break;
-        default:            s = 0; break;
+        case HAPTIC_NIBBLE:
+          if (s_irregular) { nibbleTapSchedule(nAmp, false); s = tapSample(); }
+          else             s = nibbleLegacySample(nAmp, false);
+          break;
+        case HAPTIC_BITE:
+          if (s_irregular) { nibbleTapSchedule(fminf(1.0f, nAmp * 1.6f), true); s = tapSample(); }
+          else             s = nibbleLegacySample(fminf(1.0f, nAmp * 2.2f), true);
+          break;
+        case HAPTIC_PULL: {
+          // slack: 振動を数百ms 骤停→復帰。「糸が緩んだ/まだ居る」の合図
+          //        (SIGGRAPH Asia 2024: 突然の力消失は極めて強い実在感キュー)
+          float target = 1.0f;
+          if (slackLeft > 0) { slackLeft--; target = 0.0f; }
+          slackEnv += (target - slackEnv) * 0.01f;        // ≈6ms 時定数
+          s = pullSample(pStr, pT) * slackEnv;
+          s += tapSample();                               // サージ瞬態の重畳
+          if (s > 1) s = 1; if (s < -1) s = -1;
+          break;
+        }
+        default: s = 0; break;
       }
       int16_t v = (int16_t)(s * masterEnv * MASTER_GAIN * 32767.0f);
       buf[i * 2] = v; buf[i * 2 + 1] = v;
@@ -194,5 +292,30 @@ void hapticSetNibbleAmp(float amp) {
 float hapticNibbleAmp() { return s_nibbleAmp; }
 
 void hapticSetIrregular(bool on) { s_irregular = on; }
+
+void hapticSetCarrier(float hz) {
+  if (hz < 30)  hz = 30;
+  if (hz > 150) hz = 150;
+  s_carrierHz = hz;
+}
+float hapticCarrier() { return s_carrierHz; }
+
+void hapticSetTapTau(int ms) {
+  if (ms < 30)  ms = 30;
+  if (ms > 400) ms = 400;
+  s_tapTau = ms;
+}
+int hapticTapTau() { return s_tapTau; }
+
+void hapticTriggerSlack(int ms) {
+  if (ms < 50)  ms = 50;
+  if (ms > 500) ms = 500;
+  s_slackReq = ms;
+}
+
+void hapticTriggerTap(float amp) {
+  if (amp < 0) amp = 0; if (amp > 1) amp = 1;
+  s_tapReq = amp;
+}
 
 bool hapticReady() { return s_ready; }
