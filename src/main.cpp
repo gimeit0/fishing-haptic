@@ -805,8 +805,11 @@ void updateHaptics() {
     strength = 0.7f * hapPullScale;
     Tms = hapPullTOverride > 0 ? hapPullTOverride : PULL_T_SLOW - (PULL_T_SLOW - PULL_T_FAST) / 2;
   }
-  // 供電安全リミッタ: 5V 給電路の brownout 防止 (詳細は PULL_PEAK_LIMIT_DEF)
+  // 供電安全リミッタ: 5V 給電路の brownout 防止 (詳細は PULL_PEAK_LIMIT_DEF)。
+  // 基線はここで、タップ等を含む総出力は haptics 側の最終鉗制で抑える
+  // (基線だけではセグメント完了タップ重畳時に満振幅が漏れ、実機で brownout した)
   if (strength > hapPullLimit) strength = hapPullLimit;
+  hapticSetPullLimit(hapPullLimit);
 
   hapticSetIrregular(hapIrregular);
   hapticSetPull(strength, Tms);

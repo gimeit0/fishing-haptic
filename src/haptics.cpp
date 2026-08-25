@@ -68,6 +68,7 @@ static volatile float   s_tapReq       = 0;   // >0: PULL にタップを1回重
 static volatile int     s_tapTauReq    = 0;   // タップ余振τ指定 [ms] (0=自動)
 static volatile bool    s_tugOn        = false; // 引き込み節律 (HOLD 抗適応)
 static volatile bool    s_slipOn       = false; // ドラッグ滑り (クリック列重畳)
+static volatile float   s_pullLimit    = 0.75f; // PULL 最終出力の鉗制 (供電安全)
 static bool             s_ready        = false;
 
 // ===== タスク内 合成状態 =====
@@ -347,7 +348,10 @@ static void hapticTask(void*) {
           s = pullSample(pStr, pT) * slackEnv * tugEnv * slipDuck;
           s += tapSample();                               // サージ瞬態の重畳
           s += slipSample();                              // ドラッグのクリック列
-          if (s > 1) s = 1; if (s < -1) s = -1;
+          // 供電安全: 混音後の最終鉗制。タップ等の重畳を含めた総出力を
+          // 抑えないと、5V 給電路の電流尖峰で brownout する (実機確認)
+          float lim = s_pullLimit;
+          if (s > lim) s = lim; if (s < -lim) s = -lim;
           break;
         }
         case HAPTIC_WAVE: {
@@ -475,6 +479,12 @@ void hapticSetTug(bool on) { s_tugOn = on; }
 bool hapticTug()           { return s_tugOn; }
 
 void hapticSetSlip(bool on) { s_slipOn = on; }
+
+void hapticSetPullLimit(float limit) {
+  if (limit < 0.1f) limit = 0.1f; if (limit > 1.0f) limit = 1.0f;
+  s_pullLimit = limit;
+}
+float hapticPullLimit() { return s_pullLimit; }
 
 void hapticTriggerSlack(int ms) {
   if (ms < 50)  ms = 50;

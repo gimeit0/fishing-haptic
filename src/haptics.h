@@ -95,6 +95,13 @@ bool hapticTug();
 // 糸が出て行く」感触。ラインブレイク前の触覚的前兆として使う。
 void hapticSetSlip(bool on);
 
+// PULL の最終出力クランプ (供電安全, "pl")。基線+タップ+滑りクリックの
+// 合算後に ±limit へ鉗制する。基線だけ制限してもセグメント完了タップ
+// (振幅1.0) の重畳で満振幅が出て brownout する事故が実機で起きたため、
+// 混音後の最終段で確実に抑える。1.0 = 無効。
+void  hapticSetPullLimit(float limit);
+float hapticPullLimit();
+
 // 引き提示中のイベント (方案四)。PULL モード以外では無視される:
 //  Slack: ms の間 振動を骤停→復帰 (「糸がふっと緩む」合図)
 //  Tap  : サージ開始などの瞬態を1回重畳 (amp 0..1)。
