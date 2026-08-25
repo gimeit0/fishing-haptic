@@ -816,8 +816,9 @@ void updateHaptics() {
     case IDLE:
     case CAUGHT:
     case FAILED:
-      // 渚: 待機/結果画面の環境触覚 ("竿が水辺にある" 感)。12-18s 毎の
-      // スウェルが待機電流も維持し、モバイルバッテリーの自動判停を防ぐ。
+      // 鼓動: 待機/結果画面の環境触覚。25s 毎の心拍様2連パルス (低振幅) が
+      // 「装置は生きている」ことを伝えつつ、判停窓より短い間隔で電流を流し
+      // モバイルバッテリーの自動判停も防ぐ。
       // WAITING 以降は入れない (刺激条件を汚さない)。"wa 0" で無効化。
       hapticSetMode(HAPTIC_WAVE);
       break;
@@ -835,9 +836,9 @@ void updateHaptics() {
 //    fs <0-1>   : SML 条件のサイズ値 (既定0.20)   fb <0-1> : BIG 条件 (既定0.85)
 //    bl 0|1     : 盲検モード。画面/切替音からサイズ手掛かりを消す (知覚実験用)
 //    dc 0|1     : 難易度連動。1=段数/段長もサイズ連動 (デモ用)。既定0=両条件同一
-//    wa <0-1>   : 渚(待機の環境触覚)の振幅。0=無効。既定0.35
-//    wi <sec>   : 渚の平均間隔 [秒]。既定45s
-//    wk <0-1>   : 底流(無感の保活トーン)振幅。既定0.35   wf <Hz> : 同周波数 (既定28)
+//    wa <0-1>   : 鼓動(待機の心拍パルス)の振幅。0=無効。既定0.20
+//    wi <sec>   : 鼓動の間隔 [秒]。既定25s
+//    wk <0-1>   : 底流(無感の保活トーン)振幅。既定0(判停再発時のみ)  wf <Hz> : 同周波数
 //    wd <1-4>   : 底流ソフトクリップ係数 (既定1=純正弦。保活不足時のみ上げる)
 //    ht 0|1     : HOLD 引き込み節律 (抗適応) on/off。既定 on。A/B 用
 //    hf 0|1     : HOLD 魚サイズ→周波数バイアス on/off。既定 on。A/B 用
@@ -899,13 +900,13 @@ void handleCommand(char* line) {
       if (line[1] == 'a') { hapticSetNibbleAmp(atof(arg)); Serial.printf("  nibble amp = %.2f\n", hapticNibbleAmp()); }
       break;
     case 'w':
-      if (line[1] == 'a') {                      // "wa <0-1>" 渚の振幅 (0=無効)
+      if (line[1] == 'a') {                      // "wa <0-1>" 鼓動の振幅 (0=無効)
         hapticSetWaveAmp(atof(arg));
-        Serial.printf("  wave amp = %.2f%s\n", hapticWaveAmp(),
+        Serial.printf("  heartbeat amp = %.2f%s\n", hapticWaveAmp(),
                       hapticWaveAmp() < 0.001f ? " (off)" : "");
-      } else if (line[1] == 'i') {               // "wi <sec>" 渚の平均間隔
+      } else if (line[1] == 'i') {               // "wi <sec>" 鼓動の間隔
         hapticSetWaveInterval(atoi(arg));
-        Serial.printf("  wave interval = %d s (+/-20%%)\n", hapticWaveInterval());
+        Serial.printf("  heartbeat interval = %d s (+/-10%%)\n", hapticWaveInterval());
       } else if (line[1] == 'k') {               // "wk <0-1>" 底流(保活トーン)振幅
         hapticSetUndercurrent(atof(arg));
         Serial.printf("  undercurrent amp = %.2f%s\n", hapticUndercurrent(),

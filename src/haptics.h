@@ -18,10 +18,13 @@ enum HapticMode : uint8_t {
   HAPTIC_NIBBLE,    // 前アタリ: 微弱バースト (ランダム間隔)
   HAPTIC_BITE,      // 本アタリ: 同波形を連続・強めに提示
   HAPTIC_PULL,      // 引き: 非対称矩形波による牽引力錯覚
-  HAPTIC_WAVE,      // 渚: 待機中の環境触覚。12-18s 毎に「浪が竿に寄せる」
-                    //     2.6s のスウェル (主峰+回浪)。UEC坂本研の知見に基づき
-                    //     "ふわふわ"側の柔らかい包絡。副次効果として待機電流を
-                    //     維持しモバイルバッテリーの自動判停を防ぐ
+  HAPTIC_WAVE,      // 鼓動: 待機中の環境触覚。25s 毎 (wi) に「トク・トクン」の
+                    //     心拍様2連ソフトパルス (計~0.4s, 低振幅)。連続音より
+                    //     気にならず、判停窓 (30-60s) より短い間隔で電流を流し
+                    //     モバイルバッテリーの自動判停も防ぐ。
+                    //     (旧: 45s毎の渚スウェル+連続底流。連続音が「ずっと
+                    //      震えていて変」と不評のため 2026-08-26 に置換。
+                    //      底流は wk で再有効化できるよう合成系は残置)
 };
 
 // I2S ドライバ初期化 + 波形生成タスク起動。成功で true。
@@ -56,17 +59,18 @@ float hapticCarrier();
 void hapticSetTapTau(int ms);
 int  hapticTapTau();
 
-// 渚 (WAVE) の振幅 0..1。0 で無効。既定 0.45 ("wa" コマンドで調整)
+// 鼓動 (WAVE) の振幅 0..1。0 で無効。既定 0.20 ("wa" コマンドで調整)
 void  hapticSetWaveAmp(float amp);
 float hapticWaveAmp();
 
-// 渚の平均間隔 [秒] (実際は±20%ランダム)。既定 45s。5-120s にクランプ。
+// 鼓動の間隔 [秒] (実際は±10%ランダム)。既定 25s。5-120s にクランプ。
 void hapticSetWaveInterval(int sec);
 int  hapticWaveInterval();
 
-// 底流 (undercurrent): 渚の合間を埋める保活トーン。共振点以下の低周波なので
+// 底流 (undercurrent): 鼓動の合間を埋める保活トーン。共振点以下の低周波なので
 // 体感ほぼゼロのまま電流だけ流れ、バッテリーの低負荷判停を防ぐ。
-// amp 0..1 (0=無効, 既定0.35, "wk"), 周波数 16-45Hz (既定28Hz, "wf")
+// 既定 0 (無効。連続音が不評のため 2026-08-26 に停止。判停再発時のみ "wk")
+// amp 0..1 ("wk"), 周波数 16-45Hz (既定28Hz, "wf")
 void  hapticSetUndercurrent(float amp);
 float hapticUndercurrent();
 void  hapticSetUndercurrentHz(float hz);

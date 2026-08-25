@@ -44,13 +44,17 @@ static volatile float   s_nibbleAmp    = NIBBLE_AMP_DEF;
 static volatile bool    s_irregular    = true;
 static volatile float   s_carrierHz    = CARRIER_HZ_DEF;
 static volatile int     s_tapTau       = TAP_TAU_DEF;
-static volatile float   s_waveAmp      = 0.35f;   // 渚の振幅 (0=無効)
-static volatile int     s_waveIntMs    = 45000;   // 渚の平均間隔 [ms] (実際は±20%)
+static volatile float   s_waveAmp      = 0.20f;   // 鼓動の振幅 (0=無効)。低めが基本
+static volatile int     s_waveIntMs    = 25000;   // 鼓動の間隔 [ms] (実際は±10%)
 // 底流 (undercurrent): 渚の合間を埋める保活トーン。共振周波数 (Fs≈50-60Hz) より
 // 十分低い周波数では加振器の機械出力が急減衰 (約-12dB/oct) するため体感は
 // ほぼゼロだが、音圏インピーダンスは Re≈4Ω のままなので電流は流れ続ける。
 // → 波間が何秒あってもバッテリーが「無負荷」と誤認しない。
-static volatile float   s_kaAmp        = 0.35f;   // 底流の振幅 (0=無効)
+static volatile float   s_kaAmp        = 0.0f;    // 底流の振幅 (0=無効)。
+                                                  // 既定 0: 連続音は「ずっと震えて
+                                                  // いて変」と不評 (2026-08-26)。
+                                                  // 保活は鼓動パルスに任せ、判停が
+                                                  // 再発した時だけ "wk" で復活させる
 static volatile float   s_kaHz         = 28.0f;   // 底流の周波数 [Hz] (Fs以下, HPF14Hz以上)
 static volatile float   s_kaDrive      = 1.0f;    // 底流のソフトクリップ係数 1-4。
                                                   // 1=純正弦 (既定。実機評価で高調波の
@@ -240,31 +244,34 @@ static float pullSample(float strength, int Tms) {
   return PULL_POLARITY * v * strength * wobble;
 }
 
-// --- 渚 1サンプル: 12-18s 毎の「浪が寄せる」スウェル (待機の環境触覚) ---
-//     包絡 = 主峰 (1.6s の sin² 隆起) + 0.4×回浪 (1.4s から 1.2s) を
-//     キャリアに乗せる。角のない滑らかな包絡 = UEC坂本研の水触感研究で
-//     快と評価される "ふわふわ/さらさら" 側に寄せた設計。
-//     副次効果: 待機中も周期的に電流が流れ、モバイルバッテリーの
-//     低負荷自動判停 (充電完了誤認) を防ぐ。
+// --- 鼓動 1サンプル: 25s 毎の「トク・トクン」心拍様2連パルス (待機触覚) ---
+//     lub (120ms sin²) + 180ms 間 + dub (110ms sin², 0.75×) をキャリアに
+//     乗せる。sin² の角のない包絡で、低振幅でも存在だけ伝わる設計。
+//     副次効果: 判停窓 (30-60s) より短い間隔で電流が流れ、モバイル
+//     バッテリーの低負荷自動判停 (充電完了誤認) を防ぐ。
+//     (旧: 2.6s の渚スウェル + 連続底流。連続音が不評のため置換)
 static float waveSample() {
   float amp = s_waveAmp;
   if (amp <= 0.001f) { wavePos = -1; return 0; }   // "wa 0" で無効
   if (wavePos < 0) {
     if (waveGap > 0) { waveGap--; return 0; }
-    wavePos = 0;                                    // 新しい浪 (振幅±20%ランダム)
-    waveAmpCur = amp * (0.80f + 0.20f * (rnd(0, 100) / 100.0f));
+    wavePos = 0;                                    // 新しい鼓動 (振幅±10%)
+    waveAmpCur = amp * (0.90f + 0.10f * (rnd(0, 100) / 100.0f));
   }
   float t = wavePos / (float)HAP_RATE;
   wavePos++;
-  if (t >= 2.6f) {                                  // 浪終了 → 次まで 間隔±20%
+  if (t >= 0.42f) {                                 // 鼓動終了 → 次まで 間隔±10%
     wavePos = -1;
     int im = s_waveIntMs;
-    waveGap = msToSamples(rnd(im * 4 / 5, im * 6 / 5));
+    waveGap = msToSamples(rnd(im * 9 / 10, im * 11 / 10));
     return 0;
   }
   float env = 0;
-  if (t < 1.6f)              { float x = sinf(PI * t / 1.6f);          env += x * x; }
-  if (t >= 1.4f)             { float x = sinf(PI * (t - 1.4f) / 1.2f); env += 0.4f * x * x; }
+  if (t < 0.12f) {                                  // トク (lub)
+    float x = sinf(PI * t / 0.12f);            env = x * x;
+  } else if (t >= 0.30f && t < 0.41f) {             // トクン (dub, 少し弱く)
+    float x = sinf(PI * (t - 0.30f) / 0.11f);  env = 0.75f * x * x;
+  }
   return waveAmpCur * env * sinf(phC);
 }
 
@@ -300,7 +307,7 @@ static void hapticTask(void*) {
         slackLeft = 0; slackEnv = 1;
         tugLeft = 0; tugHigh = true; tugEnv = 1;
         slipPos = -1; slipNextIn = 0; slipDuck = 1;
-        wavePos = -1;                                // 渚: 入場後 1.5-4s で最初の浪
+        wavePos = -1;                                // 鼓動: 入場後 1.5-4s で最初の一拍
         waveGap = msToSamples(rnd(1500, 4000));
       }
       advancePhases();
@@ -344,7 +351,7 @@ static void hapticTask(void*) {
           break;
         }
         case HAPTIC_WAVE: {
-          // 渚 (45s毎の氛围) + 底流 (無感の保活トーン) の重畳。
+          // 鼓動 (25s毎の心拍パルス) + 底流 (既定off, "wk" で復活可) の重畳。
           // wd=1 (既定) は純正弦。>1 でソフトクリップ (ピーク一定でRMS増)
           float k  = s_kaDrive;
           float uc = (k <= 1.001f) ? sinf(phKA)
