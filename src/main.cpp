@@ -101,7 +101,12 @@ static const char* stateName(State s) {
 #define TEN_OVER_MS      1200     // 強引すぎが連続このmsでラインブレイク
 #define TEN_UNLOAD_LIMIT 6000     // 未負荷が連続このmsで魚に逃げられる
 #define TEN_SEG_BACK     0.4f     // 未負荷中セグメント進度が戻る速度 (×実時間)
-#define TEN_AMP_MIN      0.55f    // 最小サイズ魚の振幅係数 (最大サイズ=1.0)
+#define TEN_AMP_MIN      0.40f    // 最小サイズ魚の振幅係数 (最大サイズ=1.0)。
+                                  //   0.55→0.40 (2026-08-26): サイズ対比は相対判断
+                                  //   なので、BIG を上げる代わりに SML を下げて
+                                  //   供電予算 (pl) の下で振幅比を確保する。
+                                  //   pl 鉗制で両条件のサージが同一に削られていた
+                                  //   問題もこれで解消 (SML サージが予算内に収まる)
 
 // ===== HOLD 改良 P0 (先行研究_HOLD模式.md, 2026-08-26) =====
 //   滑り: TILT_SLIP 超で「ドラグが滑る」= クリック列 + 進度後退。断線の
@@ -113,7 +118,10 @@ static const char* stateName(State s) {
 #define TEN_TILT_SLIP    48.0f    // ドラッグ滑り開始角 [deg] ("hd" で調整)
 #define TEN_SLIP_BACK    0.6f     // 滑り中セグメント進度が戻る速度 (×実時間)
 #define TEN_ADAPT_GAIN   0.18f    // セグメント充填 100% 時の振幅漸増率 (+18%)
-#define TEN_T_BIAS_SML  -3        // 最小魚の T バイアス [ms] → 周期短く軽快 (~55Hz)
+#define TEN_T_BIAS_SML  -5        // 最小魚の T バイアス [ms] → 周期短く軽快 (~40-60Hz)。
+                                  //   -3→-5 (2026-08-26): SML を共振点 (50-60Hz) 側へ
+                                  //   上探。振幅を下げた分、共振の機械効率で存在感を
+                                  //   補い、かつ BIG との周波数差を電流を増やさず拡大
 #define TEN_T_BIAS_BIG   5        // 最大魚の T バイアス [ms] → 周期長く重い (~29Hz)
                                   //   周期 5+T が牽引錯覚の有効域 (40Hz±) を
                                   //   大きく外れない範囲に留めること
@@ -647,8 +655,9 @@ void tensionFightUpdate(uint32_t now, uint32_t dt) {
     } else tenOverMs = 0;
     if (!tenSlipping && tenSegMs >= tenSegHold) {  // 1セグメント完了: 魚が一段寄る
       tenSegDone++; tenSegMs = 0;
-      // 「グッと寄った」瞬態。大きい魚ほど余振が長い=重い手応え
-      hapticTriggerTap(1.0f, 60 + (int)(80.0f * fishSize01));
+      // 「グッと寄った」瞬態。大きい魚ほど余振が長い=重い手応え。
+      // 振幅は pl 鉗制で両条件同一になるため、サイズ差は余振τ(時間)が担う
+      hapticTriggerTap(1.0f, 50 + (int)(100.0f * fishSize01));
       beep(900 + 150 * tenSegDone, 60);
       pumpFlashAt = now;
       Serial.printf("    >> SEGMENT %d/%d done\n", tenSegDone, tenSegCount);
