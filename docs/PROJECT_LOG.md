@@ -233,5 +233,10 @@ IDLE → CASTING → WAITING → NIBBLE →（BITE 窗口内合わせ）→ FIGH
 
 ## 待办 (TODO)
 
+- ⬜ **brownout 硬件对策**(方案已定,见 `changes/2026-08-26-brownout供电对策记录.md`):
+  ① MAX98357A VIN–GND 并 1000µF/16V 电解电容(贴模块,三台都装,首选);
+  ② 功放独立 5V(双充电宝,只共地);③ GAIN→VIN 降 6dB。
+  完成后 `pl 1` 验证满幅,长期稳定则把 `PULL_PEAK_LIMIT_DEF` 改回 1.0
+- ⬜ SML 持续段绝对强度实机确认(对比度下移后过弱则 `fs` 上调)
 - ⬜ 实机验证加振器振动，振幅/脉冲间隔调参（预备评估）
 - ⬜ LCD 偏暗问题：确认 M5.Display 初始化与 setBrightness
