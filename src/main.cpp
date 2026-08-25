@@ -130,10 +130,14 @@ static const char* stateName(State s) {
 //   M5PM1 経由の細い給電路で、BIG 条件 (満振幅×29Hz=共振点以下=最小インピー
 //   ダンス×3.2s 連続) の電流尖峰で 5V→3.3V 系が垂下し brownout 再起動する
 //   (実機で発生。公式 docs も電池給電時は内蔵SPK音量75%超で再起動と警告)。
-//   対策: PULL の最終振幅を既定 0.75 でクランプ ("pl" で調整)。
-//   恒久対策はハード側 (アンプ独立5V給電 / VIN に 470-1000µF / GAIN→VIN=6dB)。
-//   ハード対策後は "pl 1" で解除して満振幅に戻せる。
-#define PULL_PEAK_LIMIT_DEF 0.75f
+//   対策: PULL の最終振幅 (混音後) を既定 0.60 でクランプ ("pl" で調整)。
+//   0.75 では充電宝給電でも BROWNOUT が再現したため 0.60 に引き下げ (実測)。
+//   併せて FIGHTING 中はバックライトを落とし (BRIGHT_FIGHT)、共有給電路の
+//   ベース負荷を減らす。恒久対策はハード側 (アンプ独立5V給電 / VIN に
+//   470-1000µF / GAIN→VIN=6dB)。ハード対策後は "pl 1" で満振幅に戻せる。
+#define PULL_PEAK_LIMIT_DEF 0.60f
+#define BRIGHT_NORMAL       255    // 通常時のバックライト
+#define BRIGHT_FIGHT        170    // FIGHTING 中 (数十mA を功放へ譲る。両条件共通)
 
 // ===== 触覚提示のマッピング / Haptic mapping =====
 //   引き感 (高椋ら 2016): 振幅=引きの強さ, パルス間隔T=粗さ(暴れ感)。
@@ -312,14 +316,18 @@ void enterState(State s) {
       tenLoaded = false; tenSlipping = false; tiltDeg = 0;
       faX = restGX; faY = restGY; faZ = restGZ;
       holdTarget = (uint32_t)tenSegCount * tenSegHold;   // 疲労/CATCH%用
+      M5.Display.setBrightness(BRIGHT_FIGHT);            // 供電余裕を功放へ
       MEL(SFX_HOOKSET); break;
     case CAUGHT: {                                                                 // 胜利号角
       // 釣果はサイズ抽選と一致させる (手応え=表示)。FISH をサイズ順に参照
       static const int SIZE_ORDER[] = { 3, 0, 1, 2 };  // Perch18 < Bass23 < Trout31 < Carp45
       caughtIdx = SIZE_ORDER[(int)(fishSize01 * 3.999f)];
+      M5.Display.setBrightness(BRIGHT_NORMAL);          // 戦闘減光を戻す
       MEL(SFX_CAUGHT); break;
     }
-    case FAILED:   MEL(SFX_FAILED); break;                                         // 失落音↘
+    case FAILED:
+      M5.Display.setBrightness(BRIGHT_NORMAL);          // 戦闘減光を戻す
+      MEL(SFX_FAILED); break;                                                      // 失落音↘
     default: break;
   }
   logState();
@@ -1014,7 +1022,7 @@ void setup() {
   }
 
   M5.Display.setRotation(0);                // 逆时针 90° (旧: 1)
-  M5.Display.setBrightness(255);            // 最亮 / max brightness
+  M5.Display.setBrightness(BRIGHT_NORMAL);  // 最亮 / max brightness
   W = M5.Display.width();
   H = M5.Display.height();
 

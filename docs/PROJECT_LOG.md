@@ -86,6 +86,14 @@ IDLE → CASTING → WAITING → NIBBLE →（BITE 窗口内合わせ）→ FIGH
   (tap 1.0 叠基线后顶满摆幅)。限幅改到 haptics 侧 PULL **混音后最终钳制**
   (基线+tap+滑り click 合算后 ±limit),漏无可漏。无 panic 堆栈、直接掉
   USB,确认是供电垮而非程序 bug。
+- **追记 2**:IDLE 画面新增 `rst:` 前回复位原因显示(`esp_reset_reason()`,
+  BROWNOUT 红字)——诊断不再依赖串口。实测:0.75 限幅在充电宝
+  (ELECOM DE-M04L-3200, 5V/2.1A 单口)下仍 `rst:BROWNOUT`。额定 2.1A 够
+  平均电流,垮在瞬态:5ms 脉冲阶跃 × (充电宝环路响应+线阻+M5 内部供电路)。
+  → `pl` 默认降至 **0.60**;FIGHTING 中背光 255→**170**(BRIGHT_FIGHT,
+  两条件共通,给功放让几十 mA)。BIG 频率 29→33Hz 方案经计算撤回:共振点
+  以下阻抗随频率涨得很慢,电流收益仅几个百分点,不值得牺牲尺寸线索。
+  硬件对策(独立 5V 双充电宝接法/大电容/降 GAIN)见 HAPTICS_GUIDE 排障表。
 - 恒久对策(硬件,待做):功放独立 5V 供电(与充电宝另一口,共地)/
   VIN–GND 并 470–1000µF / GAIN 引脚接 VIN 降为 6dB。完成后 `pl 1` 解除。
 - 已烧录:2号机。**1号机/3号机待重烧**。

@@ -68,7 +68,8 @@ static volatile float   s_tapReq       = 0;   // >0: PULL にタップを1回重
 static volatile int     s_tapTauReq    = 0;   // タップ余振τ指定 [ms] (0=自動)
 static volatile bool    s_tugOn        = false; // 引き込み節律 (HOLD 抗適応)
 static volatile bool    s_slipOn       = false; // ドラッグ滑り (クリック列重畳)
-static volatile float   s_pullLimit    = 0.75f; // PULL 最終出力の鉗制 (供電安全)
+static volatile float   s_pullLimit    = 0.60f; // PULL 最終出力の鉗制 (供電安全)。
+                                                // main 側 PULL_PEAK_LIMIT_DEF と同値
 static bool             s_ready        = false;
 
 // ===== タスク内 合成状態 =====
