@@ -181,6 +181,15 @@ bool  hapIrregular   = true;   // 不規則性 on/off ("ir 0|1")。off=文献準
 bool  hapMotionCouple = true;  // 運動結合 on/off ("mc 0|1")。方案三の A/B 用
 float gyroMag        = 0;      // 直近の角速度絶対値 [deg/s] (updateLogic が更新)
 
+// ===== 電源モニタ (外部給電か内蔵電池かの判定, 充電宝テスト用) =====
+//   StickS3 は 250mAh 内蔵電池を持ち、外部電源が切れても画面は消えない。
+//   BQ27220 電量計を 1 秒毎に読み、充電中フラグ・電流・残量を画面左上に表示:
+//   充電中 or 電流≈0 = 外部給電 / 電流が負で残量低下 = 内蔵電池で動作中。
+uint32_t pwrTick = 0;
+bool     pwrChg  = false;   // M5.Power.isCharging()
+int      pwrLvl  = -1;      // 残量 [%]
+int      pwrCur  = 0;       // 電池電流 [mA] (正=充電, 負=放電)
+
 // 描画ターゲット (オフスクリーン) / Off-screen render target
 M5Canvas canvas(&M5.Display);
 bool     useSprite = false;
@@ -334,6 +343,22 @@ void drawChrome() {
   canvas.setTextColor(WHITE, curBg);
   int tw = canvas.textWidth(buf);
   canvas.setCursor(W - tw - 2, 2);
+  canvas.print(buf);
+
+  // 電源モニタ (左上): EXT=外部給電 / BAT=内蔵電池で駆動中 / PWR?=満充電で判別不能
+  if (millis() - pwrTick >= 1000) {
+    pwrTick = millis();
+    pwrChg  = M5.Power.isCharging();
+    pwrLvl  = M5.Power.getBatteryLevel();
+    int cur = (int)M5.Power.getBatteryCurrent();
+    if (cur > -10000 && cur < 10000) pwrCur = cur;   // 非対応(異常値)は捨てる
+  }
+  bool onExt = pwrChg || pwrCur > 5;                 // 充電中 or 電流流入
+  bool onBat = !pwrChg && pwrCur < -20;              // 明確な放電
+  const char* tag = onExt ? "EXT" : onBat ? "BAT" : "PWR?";
+  snprintf(buf, sizeof(buf), "%s %+dmA %d%%", tag, pwrCur, pwrLvl);
+  canvas.setTextColor(onExt ? GREEN : onBat ? ORANGE : YELLOW, curBg);
+  canvas.setCursor(2, 2);
   canvas.print(buf);
 
   snprintf(buf, sizeof(buf), "[ %s ]", stateName(state));
@@ -857,6 +882,14 @@ void updateHaptics() {
       // 引かれている(保持中)タイミングだけ振動する — 前田案の核心。
       hapticSetMode((fightMode == 1 && !tenLoaded) ? HAPTIC_OFF : HAPTIC_PULL);
       break;
+    case IDLE:
+    case CAUGHT:
+    case FAILED:
+      // 渚: 待機/結果画面の環境触覚 ("竿が水辺にある" 感)。12-18s 毎の
+      // スウェルが待機電流も維持し、モバイルバッテリーの自動判停を防ぐ。
+      // WAITING 以降は入れない (刺激条件を汚さない)。"wa 0" で無効化。
+      hapticSetMode(HAPTIC_WAVE);
+      break;
     default:       hapticSetMode(HAPTIC_OFF);    break;
   }
 }
@@ -868,6 +901,10 @@ void updateHaptics() {
 //    na <0-1>   : アタリ振幅            fc <Hz> : AMキャリア周波数 (共振点スイープ用)
 //    tt <ms>    : タップ余振τ           mc 0|1  : 運動結合 on/off
 //    fm 0|1     : 戦闘モード 0=PUMP(旧) 1=HOLD(張力保持, 前田案)。IDLE の BtnB でも切替
+//    wa <0-1>   : 渚(待機の環境触覚)の振幅。0=無効。既定0.35
+//    wi <sec>   : 渚の平均間隔 [秒]。既定45s
+//    wk <0-1>   : 底流(無感の保活トーン)振幅。既定0.35   wf <Hz> : 同周波数 (既定28)
+//    wd <1-4>   : 底流ソフトクリップ係数 (既定1=純正弦。保活不足時のみ上げる)
 // =============================================================================
 void handleCommand(char* line) {
   char cmd = line[0];
@@ -908,6 +945,26 @@ void handleCommand(char* line) {
     case 'n':
       if (line[1] == 'a') { hapticSetNibbleAmp(atof(arg)); Serial.printf("  nibble amp = %.2f\n", hapticNibbleAmp()); }
       break;
+    case 'w':
+      if (line[1] == 'a') {                      // "wa <0-1>" 渚の振幅 (0=無効)
+        hapticSetWaveAmp(atof(arg));
+        Serial.printf("  wave amp = %.2f%s\n", hapticWaveAmp(),
+                      hapticWaveAmp() < 0.001f ? " (off)" : "");
+      } else if (line[1] == 'i') {               // "wi <sec>" 渚の平均間隔
+        hapticSetWaveInterval(atoi(arg));
+        Serial.printf("  wave interval = %d s (+/-20%%)\n", hapticWaveInterval());
+      } else if (line[1] == 'k') {               // "wk <0-1>" 底流(保活トーン)振幅
+        hapticSetUndercurrent(atof(arg));
+        Serial.printf("  undercurrent amp = %.2f%s\n", hapticUndercurrent(),
+                      hapticUndercurrent() < 0.001f ? " (off)" : "");
+      } else if (line[1] == 'f') {               // "wf <Hz>" 底流の周波数
+        hapticSetUndercurrentHz(atof(arg));
+        Serial.printf("  undercurrent = %.1f Hz\n", hapticUndercurrentHz());
+      } else if (line[1] == 'd') {               // "wd <1-4>" 底流ソフトクリップ係数
+        hapticSetUndercurrentDrive(atof(arg));
+        Serial.printf("  undercurrent drive = %.1f\n", hapticUndercurrentDrive());
+      }
+      break;
     case 'i':
       if (line[1] == 'r') {
         hapIrregular = (atoi(arg) != 0);
@@ -918,7 +975,7 @@ void handleCommand(char* line) {
       break;
     default:
       Serial.println("  cmds: t 0|n|b|p|g / pa <0-1> / pt <ms> / na <0-1> / ir 0|1"
-                     " / fc <Hz> / tt <ms> / mc 0|1 / fm 0|1");
+                     " / fc <Hz> / tt <ms> / mc 0|1 / fm 0|1 / wa <0-1>");
   }
 }
 
@@ -979,7 +1036,7 @@ void setup() {
                 imuOk ? "ok" : "N/A", speakerOk ? "ok" : "N/A",
                 hapOk ? "ok" : "N/A");
   Serial.println("serial cmds: t 0|n|b|p|g / pa <0-1> / pt <ms> / na <0-1> / ir 0|1"
-                 " / fc <Hz> / tt <ms> / mc 0|1 / fm 0|1");
+                 " / fc <Hz> / tt <ms> / mc 0|1 / fm 0|1 / wa <0-1>");
 
   enterState(IDLE);
 }

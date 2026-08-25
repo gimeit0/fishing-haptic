@@ -44,6 +44,21 @@ static volatile float   s_nibbleAmp    = NIBBLE_AMP_DEF;
 static volatile bool    s_irregular    = true;
 static volatile float   s_carrierHz    = CARRIER_HZ_DEF;
 static volatile int     s_tapTau       = TAP_TAU_DEF;
+static volatile float   s_waveAmp      = 0.35f;   // 渚の振幅 (0=無効)
+static volatile int     s_waveIntMs    = 45000;   // 渚の平均間隔 [ms] (実際は±20%)
+// 底流 (undercurrent): 渚の合間を埋める保活トーン。共振周波数 (Fs≈50-60Hz) より
+// 十分低い周波数では加振器の機械出力が急減衰 (約-12dB/oct) するため体感は
+// ほぼゼロだが、音圏インピーダンスは Re≈4Ω のままなので電流は流れ続ける。
+// → 波間が何秒あってもバッテリーが「無負荷」と誤認しない。
+static volatile float   s_kaAmp        = 0.35f;   // 底流の振幅 (0=無効)
+static volatile float   s_kaHz         = 28.0f;   // 底流の周波数 [Hz] (Fs以下, HPF14Hz以上)
+static volatile float   s_kaDrive      = 1.0f;    // 底流のソフトクリップ係数 1-4。
+                                                  // 1=純正弦 (既定。実機評価で高調波の
+                                                  // ブーンが気になったため既定に戻した)。
+                                                  // >1 で正弦をtanhで"太らせ"、ピーク
+                                                  // (=体感)据え置きのままRMS電流を稼ぐ:
+                                                  // 2で電力≈1.4倍, 4で≈1.7倍。保活が
+                                                  // 足りない時だけ "wd" で実験的に上げる
 static volatile int     s_slackReq     = 0;   // >0: PULL を ms だけ骤停 (方案四)
 static volatile float   s_tapReq       = 0;   // >0: PULL にタップを1回重畳
 static bool             s_ready        = false;
@@ -51,6 +66,7 @@ static bool             s_ready        = false;
 // ===== タスク内 合成状態 =====
 static float  ph10 = 0, ph23 = 0;     // アタリ包絡 (10/23Hz) の位相
 static float  phC  = 0;               // AM キャリアの位相
+static float  phKA = 0;               // 底流の位相
 static int    pullPos = 0;            // 非対称波 1周期内のサンプル位置
 static float  lfoPh   = 0;            // 引きの"暴れ"用 低周波ゆらぎ位相
 static float  masterEnv = 0;          // モード切替クロスフェード用 0..1
@@ -67,6 +83,10 @@ static float  biteRamp = 0;           // BITE の漸強 0..1
 // PULL のイベント状態 (方案四)
 static int    slackLeft = 0;          // 骤停の残りサンプル数
 static float  slackEnv  = 1;          // 骤停用エンベロープ (クリック防止)
+// 渚 (WAVE) の状態
+static int    wavePos   = -1;         // -1=浪間の静寂, >=0 スウェル内サンプル位置
+static int    waveGap   = 0;          // 次の浪までのサンプル数
+static float  waveAmpCur = 0;         // 今回の浪の振幅 (±20% ランダム)
 
 static inline int msToSamples(int ms) { return ms * HAP_RATE / 1000; }
 static inline int rnd(int lo, int hi) { return lo + (int)(esp_random() % (uint32_t)(hi - lo + 1)); }
@@ -76,6 +96,7 @@ static inline void advancePhases() {
   ph10 += 2.0f * PI * 10.0f / HAP_RATE; if (ph10 > 2 * PI) ph10 -= 2 * PI;
   ph23 += 2.0f * PI * 23.0f / HAP_RATE; if (ph23 > 2 * PI) ph23 -= 2 * PI;
   phC  += 2.0f * PI * s_carrierHz / HAP_RATE; if (phC > 2 * PI) phC -= 2 * PI;
+  phKA += 2.0f * PI * s_kaHz / HAP_RATE; if (phKA > 2 * PI) phKA -= 2 * PI;
 }
 
 // --- 対照条件アタリ 1サンプル: 10Hz + 23Hz 合成正弦の直接出力 (才木ら 2016 準拠) ---
@@ -179,6 +200,34 @@ static float pullSample(float strength, int Tms) {
   return PULL_POLARITY * v * strength * wobble;
 }
 
+// --- 渚 1サンプル: 12-18s 毎の「浪が寄せる」スウェル (待機の環境触覚) ---
+//     包絡 = 主峰 (1.6s の sin² 隆起) + 0.4×回浪 (1.4s から 1.2s) を
+//     キャリアに乗せる。角のない滑らかな包絡 = UEC坂本研の水触感研究で
+//     快と評価される "ふわふわ/さらさら" 側に寄せた設計。
+//     副次効果: 待機中も周期的に電流が流れ、モバイルバッテリーの
+//     低負荷自動判停 (充電完了誤認) を防ぐ。
+static float waveSample() {
+  float amp = s_waveAmp;
+  if (amp <= 0.001f) { wavePos = -1; return 0; }   // "wa 0" で無効
+  if (wavePos < 0) {
+    if (waveGap > 0) { waveGap--; return 0; }
+    wavePos = 0;                                    // 新しい浪 (振幅±20%ランダム)
+    waveAmpCur = amp * (0.80f + 0.20f * (rnd(0, 100) / 100.0f));
+  }
+  float t = wavePos / (float)HAP_RATE;
+  wavePos++;
+  if (t >= 2.6f) {                                  // 浪終了 → 次まで 間隔±20%
+    wavePos = -1;
+    int im = s_waveIntMs;
+    waveGap = msToSamples(rnd(im * 4 / 5, im * 6 / 5));
+    return 0;
+  }
+  float env = 0;
+  if (t < 1.6f)              { float x = sinf(PI * t / 1.6f);          env += x * x; }
+  if (t >= 1.4f)             { float x = sinf(PI * (t - 1.4f) / 1.2f); env += 0.4f * x * x; }
+  return waveAmpCur * env * sinf(phC);
+}
+
 // --- 波形生成タスク: HAP_CHUNK フレームずつ合成して I2S へ ---
 static void hapticTask(void*) {
   static int16_t buf[HAP_CHUNK * 2];             // ステレオ (L=R 同一)
@@ -206,6 +255,8 @@ static void hapticTask(void*) {
         burstLeft = gapLeft = 0; burstEnv = 0;
         tapPos = -1; tapNextIn = 0; biteRamp = 0;
         slackLeft = 0; slackEnv = 1;
+        wavePos = -1;                                // 渚: 入場後 1.5-4s で最初の浪
+        waveGap = msToSamples(rnd(1500, 4000));
       }
       advancePhases();
       float s = 0;
@@ -226,6 +277,16 @@ static void hapticTask(void*) {
           slackEnv += (target - slackEnv) * 0.01f;        // ≈6ms 時定数
           s = pullSample(pStr, pT) * slackEnv;
           s += tapSample();                               // サージ瞬態の重畳
+          if (s > 1) s = 1; if (s < -1) s = -1;
+          break;
+        }
+        case HAPTIC_WAVE: {
+          // 渚 (45s毎の氛围) + 底流 (無感の保活トーン) の重畳。
+          // wd=1 (既定) は純正弦。>1 でソフトクリップ (ピーク一定でRMS増)
+          float k  = s_kaDrive;
+          float uc = (k <= 1.001f) ? sinf(phKA)
+                                   : tanhf(k * sinf(phKA)) / tanhf(k);
+          s = waveSample() + s_kaAmp * uc;
           if (s > 1) s = 1; if (s < -1) s = -1;
           break;
         }
@@ -306,6 +367,39 @@ void hapticSetTapTau(int ms) {
   s_tapTau = ms;
 }
 int hapticTapTau() { return s_tapTau; }
+
+void hapticSetWaveAmp(float amp) {
+  if (amp < 0) amp = 0; if (amp > 1) amp = 1;
+  s_waveAmp = amp;
+}
+float hapticWaveAmp() { return s_waveAmp; }
+
+void hapticSetWaveInterval(int sec) {
+  if (sec < 5)   sec = 5;
+  if (sec > 120) sec = 120;
+  s_waveIntMs = sec * 1000;
+}
+int hapticWaveInterval() { return s_waveIntMs / 1000; }
+
+void hapticSetUndercurrent(float amp) {
+  if (amp < 0) amp = 0; if (amp > 1) amp = 1;
+  s_kaAmp = amp;
+}
+float hapticUndercurrent() { return s_kaAmp; }
+
+void hapticSetUndercurrentHz(float hz) {
+  if (hz < 16) hz = 16;                 // MAX98357A の ~14Hz HPF より上
+  if (hz > 45) hz = 45;                 // 共振点 (Fs≈50-60Hz) より下に保つ
+  s_kaHz = hz;
+}
+float hapticUndercurrentHz() { return s_kaHz; }
+
+void hapticSetUndercurrentDrive(float k) {
+  if (k < 1) k = 1;
+  if (k > 4) k = 4;
+  s_kaDrive = k;
+}
+float hapticUndercurrentDrive() { return s_kaDrive; }
 
 void hapticTriggerSlack(int ms) {
   if (ms < 50)  ms = 50;

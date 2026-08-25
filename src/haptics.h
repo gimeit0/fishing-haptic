@@ -14,10 +14,14 @@
 #include <stdint.h>
 
 enum HapticMode : uint8_t {
-  HAPTIC_OFF = 0,   // 無振動 (IDLE / CASTING / WAITING / CAUGHT / FAILED)
+  HAPTIC_OFF = 0,   // 無振動 (CASTING / WAITING)
   HAPTIC_NIBBLE,    // 前アタリ: 微弱バースト (ランダム間隔)
   HAPTIC_BITE,      // 本アタリ: 同波形を連続・強めに提示
   HAPTIC_PULL,      // 引き: 非対称矩形波による牽引力錯覚
+  HAPTIC_WAVE,      // 渚: 待機中の環境触覚。12-18s 毎に「浪が竿に寄せる」
+                    //     2.6s のスウェル (主峰+回浪)。UEC坂本研の知見に基づき
+                    //     "ふわふわ"側の柔らかい包絡。副次効果として待機電流を
+                    //     維持しモバイルバッテリーの自動判停を防ぐ
 };
 
 // I2S ドライバ初期化 + 波形生成タスク起動。成功で true。
@@ -51,6 +55,28 @@ float hapticCarrier();
 // タップ余振の時定数 τ [ms] (方案二)。30–400ms にクランプ。
 void hapticSetTapTau(int ms);
 int  hapticTapTau();
+
+// 渚 (WAVE) の振幅 0..1。0 で無効。既定 0.45 ("wa" コマンドで調整)
+void  hapticSetWaveAmp(float amp);
+float hapticWaveAmp();
+
+// 渚の平均間隔 [秒] (実際は±20%ランダム)。既定 45s。5-120s にクランプ。
+void hapticSetWaveInterval(int sec);
+int  hapticWaveInterval();
+
+// 底流 (undercurrent): 渚の合間を埋める保活トーン。共振点以下の低周波なので
+// 体感ほぼゼロのまま電流だけ流れ、バッテリーの低負荷判停を防ぐ。
+// amp 0..1 (0=無効, 既定0.35, "wk"), 周波数 16-45Hz (既定28Hz, "wf")
+void  hapticSetUndercurrent(float amp);
+float hapticUndercurrent();
+void  hapticSetUndercurrentHz(float hz);
+float hapticUndercurrentHz();
+
+// 底流のソフトクリップ係数 1-4 ("wd")。ピーク(体感)据え置きで RMS 電流を
+// 増やす: 1≈純正弦, 2(既定)で電力≈1.4倍, 4で≈1.7倍。上げすぎると高調波
+// (3f≈84Hz) が微かに感じられることがある
+void  hapticSetUndercurrentDrive(float k);
+float hapticUndercurrentDrive();
 
 // 引き提示中のイベント (方案四)。PULL モード以外では無視される:
 //  Slack: ms の間 振動を骤停→復帰 (「糸がふっと緩む」合図)
