@@ -78,11 +78,26 @@ float hapticUndercurrentHz();
 void  hapticSetUndercurrentDrive(float k);
 float hapticUndercurrentDrive();
 
+// 引き込み節律 (HOLD 抗適応, 先行研究_HOLD模式.md 改進1)。on の間 PULL を
+// 「引き込み 250-400ms + 小休止 90-140ms」の脈群に分節する。連続同一刺激に
+// よる受容器疲労 (振動触覚適応) で主観強度が数秒で落ちるのを防ぐ。
+// 小休止は 0 でなく ~42% (張力の底) に留め、slack イベントとは区別する。
+// ir 0 (文献準拠の対照条件) では無効。
+void hapticSetTug(bool on);
+bool hapticTug();
+
+// ドラッグ滑り (HOLD 改進4)。on の間 PULL に「嗒嗒嗒」クリック列
+// (55-90ms 間隔) を重畳し、基礎張力を ~55% に落とす =「ドラグが滑って
+// 糸が出て行く」感触。ラインブレイク前の触覚的前兆として使う。
+void hapticSetSlip(bool on);
+
 // 引き提示中のイベント (方案四)。PULL モード以外では無視される:
 //  Slack: ms の間 振動を骤停→復帰 (「糸がふっと緩む」合図)
-//  Tap  : サージ開始などの瞬態を1回重畳 (amp 0..1)
+//  Tap  : サージ開始などの瞬態を1回重畳 (amp 0..1)。
+//         tauMs>0 で余振の時定数を指定 (0=自動 60-100ms)。魚サイズに応じた
+//         「重い/軽い」瞬態の描き分けに使う (30Hz 側=重い の知見に対応)
 void hapticTriggerSlack(int ms);
-void hapticTriggerTap(float amp);
+void hapticTriggerTap(float amp, int tauMs = 0);
 
 // I2S 初期化に成功していれば true (配線無しでもデモは動く)
 bool hapticReady();

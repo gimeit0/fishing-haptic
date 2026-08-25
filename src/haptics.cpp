@@ -61,6 +61,9 @@ static volatile float   s_kaDrive      = 1.0f;    // 底流のソフトクリッ
                                                   // 足りない時だけ "wd" で実験的に上げる
 static volatile int     s_slackReq     = 0;   // >0: PULL を ms だけ骤停 (方案四)
 static volatile float   s_tapReq       = 0;   // >0: PULL にタップを1回重畳
+static volatile int     s_tapTauReq    = 0;   // タップ余振τ指定 [ms] (0=自動)
+static volatile bool    s_tugOn        = false; // 引き込み節律 (HOLD 抗適応)
+static volatile bool    s_slipOn       = false; // ドラッグ滑り (クリック列重畳)
 static bool             s_ready        = false;
 
 // ===== タスク内 合成状態 =====
@@ -83,6 +86,15 @@ static float  biteRamp = 0;           // BITE の漸強 0..1
 // PULL のイベント状態 (方案四)
 static int    slackLeft = 0;          // 骤停の残りサンプル数
 static float  slackEnv  = 1;          // 骤停用エンベロープ (クリック防止)
+// 引き込み節律 (抗適応) の状態
+static int    tugLeft = 0;            // 現フェーズの残りサンプル数
+static bool   tugHigh = true;         // true=引き込み中 / false=小休止
+static float  tugEnv  = 1;            // 節律エンベロープ (平滑済み)
+// ドラッグ滑り (クリック列) の状態
+static int    slipPos = -1;           // -1=クリック間, >=0 クリック内位置
+static int    slipNextIn = 0;         // 次クリックまでのサンプル数
+static int    slipClickLen = 0;
+static float  slipDuck = 1;           // 滑り中の基礎張力ダック (平滑済み)
 // 渚 (WAVE) の状態
 static int    wavePos   = -1;         // -1=浪間の静寂, >=0 スウェル内サンプル位置
 static int    waveGap   = 0;          // 次の浪までのサンプル数
@@ -147,6 +159,34 @@ static float tapSample() {
   }
   tapPos++;
   return tapAmp * v;
+}
+
+// --- ドラッグ滑りクリック 1サンプル: 3ms 半正弦 + 18ms の短い余韻 を
+//     55-90ms 間隔で繰り返す =「ドラグがジジジと糸を出す」感触。
+//     タップ(サージ/セグメント完了イベント)とは状態を分離し、干渉しない。
+//     開始済みクリックは s_slipOn が落ちても最後まで再生 (切断ノイズ防止)。
+static float slipSample() {
+  if (slipPos < 0) {
+    if (!s_slipOn) { slipNextIn = 0; return 0; }
+    if (slipNextIn > 0) { slipNextIn--; return 0; }
+    slipClickLen = msToSamples(3);
+    slipPos = 0;
+  }
+  int ringLen = msToSamples(18);
+  if (slipPos >= slipClickLen + ringLen) {
+    slipPos = -1;
+    slipNextIn = msToSamples(rnd(55, 90));
+    return 0;
+  }
+  float v;
+  if (slipPos < slipClickLen) {
+    v = sinf(PI * slipPos / (float)slipClickLen);            // クリック本体
+  } else {
+    float d = (slipPos - slipClickLen) / (float)ringLen;     // 線形に消える余韻
+    v = (1.0f - d) * 0.35f * sinf(phC);
+  }
+  slipPos++;
+  return 0.85f * v;
 }
 
 // --- 改良版アタリ: タップイベント列のスケジューラ (方案二) ---
@@ -240,9 +280,12 @@ static void hapticTask(void*) {
     // PULL 中のイベント要求を取り込む (方案四)。他モードでは破棄。
     if (modeApplied == HAPTIC_PULL) {
       if (s_slackReq > 0) { slackLeft = msToSamples(s_slackReq); s_slackReq = 0; }
-      if (s_tapReq   > 0) { tapStart(s_tapReq, rnd(60, 100));    s_tapReq   = 0; }
+      if (s_tapReq   > 0) {
+        tapStart(s_tapReq, s_tapTauReq > 0 ? s_tapTauReq : rnd(60, 100));
+        s_tapReq = 0; s_tapTauReq = 0;
+      }
     } else {
-      s_slackReq = 0; s_tapReq = 0;
+      s_slackReq = 0; s_tapReq = 0; s_tapTauReq = 0;
     }
 
     for (int i = 0; i < HAP_CHUNK; i++) {
@@ -255,6 +298,8 @@ static void hapticTask(void*) {
         burstLeft = gapLeft = 0; burstEnv = 0;
         tapPos = -1; tapNextIn = 0; biteRamp = 0;
         slackLeft = 0; slackEnv = 1;
+        tugLeft = 0; tugHigh = true; tugEnv = 1;
+        slipPos = -1; slipNextIn = 0; slipDuck = 1;
         wavePos = -1;                                // 渚: 入場後 1.5-4s で最初の浪
         waveGap = msToSamples(rnd(1500, 4000));
       }
@@ -275,8 +320,26 @@ static void hapticTask(void*) {
           float target = 1.0f;
           if (slackLeft > 0) { slackLeft--; target = 0.0f; }
           slackEnv += (target - slackEnv) * 0.01f;        // ≈6ms 時定数
-          s = pullSample(pStr, pT) * slackEnv;
+
+          // 引き込み節律 (HOLD 抗適応): 250-400ms 引く / 90-140ms ふっと緩む。
+          // 小休止は 0.42 止まり (完全無音は slack の合図と紛れるため)
+          float tugT = 1.0f;
+          if (s_irregular && s_tugOn) {
+            if (tugLeft <= 0) {
+              tugHigh = !tugHigh;
+              tugLeft = msToSamples(tugHigh ? rnd(250, 400) : rnd(90, 140));
+            }
+            tugLeft--;
+            tugT = tugHigh ? 1.0f : 0.42f;
+          } else { tugLeft = 0; tugHigh = true; }
+          tugEnv += (tugT - tugEnv) * 0.004f;             // ≈16ms 時定数
+
+          // ドラッグ滑り: 基礎張力を ~55% にダック (糸が出て張力が抜ける)
+          slipDuck += ((s_slipOn ? 0.55f : 1.0f) - slipDuck) * 0.01f;
+
+          s = pullSample(pStr, pT) * slackEnv * tugEnv * slipDuck;
           s += tapSample();                               // サージ瞬態の重畳
+          s += slipSample();                              // ドラッグのクリック列
           if (s > 1) s = 1; if (s < -1) s = -1;
           break;
         }
@@ -401,14 +464,21 @@ void hapticSetUndercurrentDrive(float k) {
 }
 float hapticUndercurrentDrive() { return s_kaDrive; }
 
+void hapticSetTug(bool on) { s_tugOn = on; }
+bool hapticTug()           { return s_tugOn; }
+
+void hapticSetSlip(bool on) { s_slipOn = on; }
+
 void hapticTriggerSlack(int ms) {
   if (ms < 50)  ms = 50;
   if (ms > 500) ms = 500;
   s_slackReq = ms;
 }
 
-void hapticTriggerTap(float amp) {
+void hapticTriggerTap(float amp, int tauMs) {
   if (amp < 0) amp = 0; if (amp > 1) amp = 1;
+  if (tauMs < 0) tauMs = 0; if (tauMs > 400) tauMs = 400;
+  s_tapTauReq = tauMs;          // 先に τ を置いてから amp で発火 (タスク側は amp を見る)
   s_tapReq = amp;
 }
 

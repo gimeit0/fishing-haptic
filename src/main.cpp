@@ -115,6 +115,21 @@ static const char* stateName(State s) {
 #define TEN_SEG_BACK     0.4f     // 未負荷中セグメント進度が戻る速度 (×実時間)
 #define TEN_AMP_MIN      0.55f    // 最小サイズ魚の振幅係数 (最大サイズ=1.0)
 
+// ===== HOLD 改良 P0 (先行研究_HOLD模式.md, 2026-08-26) =====
+//   滑り: TILT_SLIP 超で「ドラグが滑る」= クリック列 + 進度後退。断線の
+//         触覚的前兆 (突然の懲罰 → 兆候のある挽回可能状態へ)。
+//   適応: 負荷中の連続振動は数秒で主観強度が落ちる (振動触覚適応) ため、
+//         セグメント内で振幅を漸増して補償 + haptics 側の引き込み節律。
+//   サイズ: 30Hz 側の低周波は「重い」と知覚される知見に基づき、魚サイズを
+//         振幅だけでなくパルス間隔T (基本周波数) にも写像する。
+#define TEN_TILT_SLIP    48.0f    // ドラッグ滑り開始角 [deg] ("hd" で調整)
+#define TEN_SLIP_BACK    0.6f     // 滑り中セグメント進度が戻る速度 (×実時間)
+#define TEN_ADAPT_GAIN   0.18f    // セグメント充填 100% 時の振幅漸増率 (+18%)
+#define TEN_T_BIAS_SML  -3        // 最小魚の T バイアス [ms] → 周期短く軽快 (~55Hz)
+#define TEN_T_BIAS_BIG   5        // 最大魚の T バイアス [ms] → 周期長く重い (~29Hz)
+                                  //   周期 5+T が牽引錯覚の有効域 (40Hz±) を
+                                  //   大きく外れない範囲に留めること
+
 // ===== 触覚提示のマッピング / Haptic mapping =====
 //   引き感 (高椋ら 2016): 振幅=引きの強さ, パルス間隔T=粗さ(暴れ感)。
 //   ゲーム側の魚の引き driftPerSec と連動させ、サージ時は強く粗い引きにする。
@@ -168,6 +183,8 @@ uint32_t tenSegMs    = 0;             // 現セグメントの保持累計 [ms]
 uint32_t tenOverMs   = 0;             // 強引すぎ(過傾)の連続時間 [ms]
 uint32_t tenUnloadMs = 0;             // 未負荷の連続時間 [ms]
 bool     tenLoaded   = false;         // 負荷中 (傾き保持中) か
+bool     tenSlipping = false;         // ドラッグ滑り中 (過傾でクリック列+進度後退)
+float    tenTiltSlip = TEN_TILT_SLIP; // 滑り開始角 ("hd" で実機調整)
 float    tiltDeg     = 0;             // 基線からの傾き [deg]
 float    restGX = 0, restGY = 0, restGZ = 1;  // 静止時の重力ベクトル基線
 bool     restGInit   = false;
@@ -179,6 +196,8 @@ int   hapPullTOverride = 0;    // >0 ならパルス間隔T を固定 [ms] ("pt 
 int   hapTestMode    = -1;     // -1=ゲーム連動, それ以外は HapticMode を強制 ("t p" 等)
 bool  hapIrregular   = true;   // 不規則性 on/off ("ir 0|1")。off=文献準拠の対照条件
 bool  hapMotionCouple = true;  // 運動結合 on/off ("mc 0|1")。方案三の A/B 用
+bool  hapTug         = true;   // HOLD 引き込み節律 (抗適応) on/off ("ht 0|1")。A/B 用
+bool  hapSizeFreq    = true;   // HOLD 魚サイズ→T バイアス on/off ("hf 0|1")。A/B 用
 float gyroMag        = 0;      // 直近の角速度絶対値 [deg/s] (updateLogic が更新)
 
 // ===== 電源モニタ (外部給電か内蔵電池かの判定, 充電宝テスト用) =====
@@ -278,7 +297,7 @@ void enterState(State s) {
       tenSegCount = 3 + (fishSize01 > 0.4f) + (fishSize01 > 0.75f);   // 3–5段
       tenSegHold  = 2500 + (uint32_t)(1500.0f * fishSize01);          // 2.5–4s/段
       tenSegDone = 0; tenSegMs = 0; tenOverMs = 0; tenUnloadMs = 0;
-      tenLoaded = false; tiltDeg = 0;
+      tenLoaded = false; tenSlipping = false; tiltDeg = 0;
       faX = restGX; faY = restGY; faZ = restGZ;
       if (fightMode == 1) holdTarget = (uint32_t)tenSegCount * tenSegHold; // 疲労/CATCH%用
       MEL(SFX_HOOKSET); break;
@@ -406,10 +425,13 @@ void renderFightTension() {
     canvas.drawRect(barX - 3, barY - 3, barW + 6, barH + 6, WHITE);
 
   bool over = tenLoaded && tiltDeg > TEN_TILT_OVER;
+  bool slip = tenLoaded && !over && tenSlipping;
   const char* hint = over ? "TOO HIGH! ease off"
+                   : slip ? "DRAG SLIPS! ease off"
                    : tenLoaded ? "HOLD... feel the fish"
                    : "RAISE the rod !";
-  textC(hint, W / 2, barY + barH + 8, 1, over ? RED : (tenLoaded ? GREEN : ORANGE));
+  textC(hint, W / 2, barY + barH + 8, 1,
+        over ? RED : slip ? YELLOW : (tenLoaded ? GREEN : ORANGE));
 
   if (hapticReady()) {
     snprintf(b, sizeof(b), "A:%d%% T:%dms tilt:%d",
@@ -627,7 +649,18 @@ void tensionFightUpdate(uint32_t now, uint32_t dt) {
   uint32_t el = now - stateStart;
   if (tenLoaded) {
     tenUnloadMs = 0;
-    tenSegMs += dt;
+    // ドラッグ滑り: 滑り角を超えている間は進度が進まず逆に戻る (糸が出て行く)。
+    // クリック列と張力ダックは haptics 側 (hapticSetSlip) が重畳する。
+    tenSlipping = tiltDeg > tenTiltSlip;
+    if (tenSlipping) {
+      uint32_t back = (uint32_t)(dt * TEN_SLIP_BACK);
+      tenSegMs = (tenSegMs > back) ? tenSegMs - back : 0;
+      if (tiltDeg <= TEN_TILT_OVER && now - sfxTick >= 110) {  // 出線のジジジ音
+        beep(1250, 26); sfxTick = now;
+      }
+    } else {
+      tenSegMs += dt;
+    }
     if (tiltDeg > TEN_TILT_OVER) {                 // 強引すぎ: 警告→ラインブレイク
       tenOverMs += dt;
       if (now - sfxTick >= 150) { beep(2800, 60); sfxTick = now; }
@@ -636,9 +669,10 @@ void tensionFightUpdate(uint32_t now, uint32_t dt) {
         failReason = "Line broke!"; enterState(FAILED); return;
       }
     } else tenOverMs = 0;
-    if (tenSegMs >= tenSegHold) {                  // 1セグメント完了: 魚が一段寄る
+    if (!tenSlipping && tenSegMs >= tenSegHold) {  // 1セグメント完了: 魚が一段寄る
       tenSegDone++; tenSegMs = 0;
-      hapticTriggerTap(1.0f);                      // 「グッと寄った」瞬態
+      // 「グッと寄った」瞬態。大きい魚ほど余振が長い=重い手応え
+      hapticTriggerTap(1.0f, 60 + (int)(80.0f * fishSize01));
       beep(900 + 150 * tenSegDone, 60);
       pumpFlashAt = now;
       Serial.printf("    >> SEGMENT %d/%d done\n", tenSegDone, tenSegCount);
@@ -646,6 +680,7 @@ void tensionFightUpdate(uint32_t now, uint32_t dt) {
     }
   } else {
     tenOverMs = 0;
+    tenSlipping = false;
     tenUnloadMs += dt;
     uint32_t back = (uint32_t)(dt * TEN_SEG_BACK); // 糸が緩み進度が少し戻される
     tenSegMs = (tenSegMs > back) ? tenSegMs - back : 0;
@@ -828,7 +863,10 @@ void updateHaptics() {
       float loadFac = 0.85f + 0.30f * t01;
       // 魚サイズ→振幅 (高椋ら2016: 振幅・周波数で魚サイズの印象を変調可能)
       float sizeFac = TEN_AMP_MIN + (1.0f - TEN_AMP_MIN) * fishSize01;
-      strength = s01 * loadFac * sizeFac * hapPullScale;
+      // 抗適応の漸増: セグメント充填に沿って +18% まで振幅を上げ、
+      // 触覚適応 (連続刺激で主観強度が数秒で低下) を補償する
+      float adaptFac = 1.0f + TEN_ADAPT_GAIN * ((float)tenSegMs / (float)tenSegHold);
+      strength = s01 * loadFac * sizeFac * adaptFac * hapPullScale;
     } else {
       // ＝＝ PUMP モード (旧) ＝＝
       // [張力層1] 竿の姿勢: 竿を立てている(マーカー高)ほど張力大 ×0.85-1.15
@@ -862,6 +900,10 @@ void updateHaptics() {
     Tms = hapPullTOverride > 0
         ? hapPullTOverride
         : (int)roundf(PULL_T_SLOW - k * (PULL_T_SLOW - PULL_T_FAST));
+    // HOLD: 魚サイズ→基本周波数バイアス。大きい魚ほど T 長 (低周波=重い),
+    // 小さい魚ほど T 短 (高周波=軽快)。"pt" で T 固定中は適用しない。
+    if (state == FIGHTING && fightMode == 1 && hapSizeFreq && hapPullTOverride <= 0)
+      Tms += TEN_T_BIAS_SML + (int)roundf((TEN_T_BIAS_BIG - TEN_T_BIAS_SML) * fishSize01);
   } else {
     // ＝＝ 規則モード(対照条件): 高椋ら2016と同じ一定振幅・一定間隔 ＝＝
     strength = 0.7f * hapPullScale;
@@ -869,6 +911,9 @@ void updateHaptics() {
   }
   hapticSetIrregular(hapIrregular);
   hapticSetPull(strength, Tms);
+  // HOLD 中のみ: 引き込み節律 (抗適応) と ドラッグ滑り (クリック列+張力ダック)
+  hapticSetTug(hapTug && state == FIGHTING && fightMode == 1);
+  hapticSetSlip(state == FIGHTING && fightMode == 1 && tenLoaded && tenSlipping);
 
   if (hapTestMode >= 0) {                    // シリアルからの強制モード (ベンチ試験)
     hapticSetMode((HapticMode)hapTestMode);
@@ -905,6 +950,9 @@ void updateHaptics() {
 //    wi <sec>   : 渚の平均間隔 [秒]。既定45s
 //    wk <0-1>   : 底流(無感の保活トーン)振幅。既定0.35   wf <Hz> : 同周波数 (既定28)
 //    wd <1-4>   : 底流ソフトクリップ係数 (既定1=純正弦。保活不足時のみ上げる)
+//    ht 0|1     : HOLD 引き込み節律 (抗適応) on/off。既定 on。A/B 用
+//    hf 0|1     : HOLD 魚サイズ→周波数バイアス on/off。既定 on。A/B 用
+//    hd <deg>   : ドラッグ滑り開始角 [deg]。既定48。30-55 にクランプ
 // =============================================================================
 void handleCommand(char* line) {
   char cmd = line[0];
@@ -965,6 +1013,20 @@ void handleCommand(char* line) {
         Serial.printf("  undercurrent drive = %.1f\n", hapticUndercurrentDrive());
       }
       break;
+    case 'h':
+      if (line[1] == 't') {                      // "ht 0|1" 引き込み節律 (抗適応)
+        hapTug = (atoi(arg) != 0);
+        Serial.printf("  hold tug rhythm = %s\n", hapTug ? "ON" : "OFF");
+      } else if (line[1] == 'f') {               // "hf 0|1" サイズ→周波数バイアス
+        hapSizeFreq = (atoi(arg) != 0);
+        Serial.printf("  size->freq bias = %s\n", hapSizeFreq ? "ON" : "OFF");
+      } else if (line[1] == 'd') {               // "hd <deg>" 滑り開始角
+        float d = atof(arg);
+        if (d < 30) d = 30; if (d > 55) d = 55;
+        tenTiltSlip = d;
+        Serial.printf("  drag slip tilt = %.0f deg\n", tenTiltSlip);
+      }
+      break;
     case 'i':
       if (line[1] == 'r') {
         hapIrregular = (atoi(arg) != 0);
@@ -975,7 +1037,8 @@ void handleCommand(char* line) {
       break;
     default:
       Serial.println("  cmds: t 0|n|b|p|g / pa <0-1> / pt <ms> / na <0-1> / ir 0|1"
-                     " / fc <Hz> / tt <ms> / mc 0|1 / fm 0|1 / wa <0-1>");
+                     " / fc <Hz> / tt <ms> / mc 0|1 / fm 0|1 / wa <0-1>"
+                     " / ht 0|1 / hf 0|1 / hd <deg>");
   }
 }
 
@@ -1036,7 +1099,8 @@ void setup() {
                 imuOk ? "ok" : "N/A", speakerOk ? "ok" : "N/A",
                 hapOk ? "ok" : "N/A");
   Serial.println("serial cmds: t 0|n|b|p|g / pa <0-1> / pt <ms> / na <0-1> / ir 0|1"
-                 " / fc <Hz> / tt <ms> / mc 0|1 / fm 0|1 / wa <0-1>");
+                 " / fc <Hz> / tt <ms> / mc 0|1 / fm 0|1 / wa <0-1>"
+                 " / ht 0|1 / hf 0|1 / hd <deg>");
 
   enterState(IDLE);
 }
