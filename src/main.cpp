@@ -125,6 +125,16 @@ static const char* stateName(State s) {
 #define SEG_COUNT_FIXED  4        // 段数 (両条件共通)
 #define SEG_HOLD_FIXED   3200     // 1段の保持時間 [ms] (全長 ~12.8s+回退分)
 
+// ===== 供電安全: 引き波形のピークリミッタ (2026-08-26) =====
+//   MAX98357A は 4Ω/5V で 3.2W (ピーク電流 ≈1.2A)。M5StickS3 の 5V ピンは
+//   M5PM1 経由の細い給電路で、BIG 条件 (満振幅×29Hz=共振点以下=最小インピー
+//   ダンス×3.2s 連続) の電流尖峰で 5V→3.3V 系が垂下し brownout 再起動する
+//   (実機で発生。公式 docs も電池給電時は内蔵SPK音量75%超で再起動と警告)。
+//   対策: PULL の最終振幅を既定 0.75 でクランプ ("pl" で調整)。
+//   恒久対策はハード側 (アンプ独立5V給電 / VIN に 470-1000µF / GAIN→VIN=6dB)。
+//   ハード対策後は "pl 1" で解除して満振幅に戻せる。
+#define PULL_PEAK_LIMIT_DEF 0.75f
+
 // ===== 触覚提示のマッピング / Haptic mapping =====
 //   引き感 (高椋ら 2016): 振幅=引きの強さ, パルス間隔T=粗さ(暴れ感)。
 //   ゲーム側の魚の引き driftPerSec と連動させ、サージ時は強く粗い引きにする。
@@ -183,6 +193,7 @@ float    faX = 0, faY = 0, faZ = 1;   // 加速度の低域通過値 (揺れ除�
 
 // ===== 触覚チューニング (シリアルコマンドで調整, 予備評価用) =====
 float hapPullScale   = 1.0f;   // 引き振幅の全体スケール ("pa 0.8")
+float hapPullLimit   = PULL_PEAK_LIMIT_DEF;  // 引き振幅の上限クランプ ("pl", 供電安全)
 int   hapPullTOverride = 0;    // >0 ならパルス間隔T を固定 [ms] ("pt 17", 0=自動)
 int   hapTestMode    = -1;     // -1=ゲーム連動, それ以外は HapticMode を強制 ("t p" 等)
 bool  hapIrregular   = true;   // 不規則性 on/off ("ir 0|1")。off=文献準拠の対照条件
@@ -794,6 +805,9 @@ void updateHaptics() {
     strength = 0.7f * hapPullScale;
     Tms = hapPullTOverride > 0 ? hapPullTOverride : PULL_T_SLOW - (PULL_T_SLOW - PULL_T_FAST) / 2;
   }
+  // 供電安全リミッタ: 5V 給電路の brownout 防止 (詳細は PULL_PEAK_LIMIT_DEF)
+  if (strength > hapPullLimit) strength = hapPullLimit;
+
   hapticSetIrregular(hapIrregular);
   hapticSetPull(strength, Tms);
   // 引き込み節律 (抗適応) は実戦と台架試験の両方で有効 (刺激を一致させる)。
@@ -830,6 +844,7 @@ void updateHaptics() {
 //  シリアルコマンド / Serial tuning commands (予備評価でのパラメータ探索用)
 //    t 0|n|b|p  : 触覚モードを強制 (off/nibble/bite/pull)   t g : ゲーム連動へ戻す
 //    pa <0-1>   : 引き振幅スケール      pt <ms> : パルス間隔T固定 (pt 0 で自動)
+//    pl <0-1>   : 引き振幅の上限 (供電安全リミッタ)。既定0.75。ハード対策後 pl 1
 //    na <0-1>   : アタリ振幅            fc <Hz> : AMキャリア周波数 (共振点スイープ用)
 //    tt <ms>    : タップ余振τ
 //    fm 0|1     : 魚サイズ条件 0=SML 1=BIG (IDLE の BtnB でも切替)
@@ -895,6 +910,13 @@ void handleCommand(char* line) {
     case 'p':
       if (line[1] == 'a') { hapPullScale = atof(arg); Serial.printf("  pull scale = %.2f\n", hapPullScale); }
       if (line[1] == 't') { hapPullTOverride = atoi(arg); Serial.printf("  pull T = %d ms (0=auto)\n", hapPullTOverride); }
+      if (line[1] == 'l') {                      // "pl <0-1>" ピークリミッタ (供電安全)
+        float v = atof(arg);
+        if (v < 0.1f) v = 0.1f; if (v > 1.0f) v = 1.0f;
+        hapPullLimit = v;
+        Serial.printf("  pull peak limit = %.2f%s\n", hapPullLimit,
+                      hapPullLimit >= 0.999f ? " (off - ensure ext 5V!)" : "");
+      }
       break;
     case 'n':
       if (line[1] == 'a') { hapticSetNibbleAmp(atof(arg)); Serial.printf("  nibble amp = %.2f\n", hapticNibbleAmp()); }
@@ -942,7 +964,7 @@ void handleCommand(char* line) {
       }
       break;
     default:
-      Serial.println("  cmds: t 0|n|b|p|g / pa <0-1> / pt <ms> / na <0-1> / ir 0|1"
+      Serial.println("  cmds: t 0|n|b|p|g / pa|pl <0-1> / pt <ms> / na <0-1> / ir 0|1"
                      " / fc <Hz> / tt <ms> / wa <0-1> / ht 0|1 / hf 0|1 / hd <deg>"
                      " / fm 0|1 / fs|fb <0-1> / bl 0|1 / dc 0|1");
   }
@@ -1004,7 +1026,7 @@ void setup() {
                 W, H, useSprite ? "on" : "off",
                 imuOk ? "ok" : "N/A", speakerOk ? "ok" : "N/A",
                 hapOk ? "ok" : "N/A");
-  Serial.println("serial cmds: t 0|n|b|p|g / pa <0-1> / pt <ms> / na <0-1> / ir 0|1"
+  Serial.println("serial cmds: t 0|n|b|p|g / pa|pl <0-1> / pt <ms> / na <0-1> / ir 0|1"
                  " / fc <Hz> / tt <ms> / wa <0-1> / ht 0|1 / hf 0|1 / hd <deg>"
                  " / fm 0|1 / fs|fb <0-1> / bl 0|1 / dc 0|1");
 
