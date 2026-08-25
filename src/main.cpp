@@ -19,8 +19,8 @@
 //                            視覚的代替 (画面の微小シェイク)。   ★才木ら 2016
 //   5. BITE      本アタリ  : 合わせ(ジャーク)を要求する勝負所。
 //                            IMU で挥竿動作を検出。              ★才木ら 2016
-//   6. FIGHTING  やり取り  : 牽引力錯覚 = 引き感覚。のべ竿は巻けない為、
-//                            竿を上に煽る(ポンピング/上提)で寄せる。  ★高椋ら 2016
+//   6. FIGHTING  やり取り  : 牽引力錯覚 = 引き感覚。竿を高く保持している間
+//                            だけ魚の抵抗を提示する張力保持 (HOLD)。   ★高椋ら 2016
 //   7. CAUGHT    キャッチ  : 釣果(魚種・サイズ)を提示。         (demo拡張)
 //   8. FAILED    バラし    : 失敗。原因を提示。                 (demo拡張)
 //
@@ -64,29 +64,20 @@ static const char* stateName(State s) {
 // ===== BITE: 合わせ(あおり) / hook-set jerk =====
 #define JERK_THRESHOLD_G 1.5f     // |加速度| > 1.5g で「合わせ」成立
 
-// ===== FIGHTING: やり取り (Stardew Valley / Sea of Thieves 風の"ゾーン維持") =====
-//   のべ竿はリールで巻けない。竿を上に煽る(上提)とマーカーが上昇し、
-//   魚の引きでマーカーは下方へ"ランダムな速度"で減衰する。
-//   2本の赤線で挟んだスイートゾーン内にマーカーを保ち続け、累計が
-//   ランダムな目標時間に達すると捕獲。ゾーン外が続くと逃げられる。
-//   ※張力概念は廃止(ゾーンを上に外す=強引/下に外す=緩み を一本化)。
-#define ROD_START        50.0f    // マーカー初期位置 0-100 (ゾーン中央)
-#define ZONE_LO          32.0f    // スイートゾーン下限(左の赤線) ※横バー
-#define ZONE_HI          72.0f    // スイートゾーン上限(右の赤線) ※幅40に拡大
-#define PUMP_RISE        20.0f    // 1回の上提でマーカーが進む量 (長期戦向けに約1回/秒で維持可能に)
-#define DRIFT_MIN        12.0f    // 通常の引き(減衰) 下限 [/秒] ※反応しやすく緩和
-#define DRIFT_MAX        30.0f    // 通常の引き(減衰) 上限 [/秒]
-#define DRIFT_SURGE      52.0f    // 突進(サージ)時の減衰 [/秒]
+// ===== FIGHTING: 魚の行動モデル / fish behaviour model =====
+//   突進(サージ)/休息/通常 の3態を確率的に再抽選し、driftPerSec が触覚の
+//   振幅テクスチャと slack/サージ瞬態イベントを駆動する。
+//   ※旧 PUMP モード (ゾーン維持ゲージ+上提検出) は 2026-08-26 に廃止。
+//     FIGHTING は張力保持 (HOLD) のみ。マーカー/ゾーン/運動結合の定数は
+//     その時に削除 (履歴は changes/2026-08-26-大小鱼二择感知实验版.md)。
+#define DRIFT_MIN        12.0f    // 通常の引き 下限 [/秒]
+#define DRIFT_MAX        30.0f    // 通常の引き 上限 [/秒]
+#define DRIFT_SURGE      52.0f    // 突進(サージ)時 [/秒]
 #define SURGE_CHANCE     10       // 再抽選毎にサージへ入る確率 [%]
-#define DRIFT_REST       4.0f     // 休息(魚が引きを緩める)時の減衰 [/秒]
+#define DRIFT_REST       4.0f     // 休息(魚が引きを緩める)時 [/秒]
 #define REST_CHANCE      18       // 再抽選毎に休息へ入る確率 [%]
-#define DRIFT_REROLL_MIN 550      // 減衰速度の再抽選間隔 下限 [ms]
+#define DRIFT_REROLL_MIN 550      // 再抽選間隔 下限 [ms]
 #define DRIFT_REROLL_MAX 1100     // 同 上限 [ms]
-#define HOLD_TARGET_MIN  12000    // 捕獲に必要な"ゾーン維持"累計時間 下限 [ms]
-#define HOLD_TARGET_MAX  18000    // 同 上限 [ms] (毎回ランダム)
-                                  //   ※実測の全程体感は20-30秒。Sea of Thieves(通常魚~45秒)と
-                                  //     Stardew Valley(~10-20秒)の中間を狙った値。
-#define ESCAPE_LIMIT     3000     // ゾーン外が連続このmsを超えるとバラし (長期戦化に伴い緩和)
 // 魚の疲労(burst-and-coast): 進度が上がるほど突進が減り休息が増える。
 //   Bainbridge1958 [高椋論文の引用文献17]: 遊泳速度は尾振り「頻度」で決まり、
 //   振幅は5Hz以上でほぼ一定。よって疲労は「爆発の頻度・密度の低下」として現れる
@@ -95,11 +86,8 @@ static const char* stateName(State s) {
 //   ※実験で変数を切り分けたい時は両定数を0にすれば疲労弧線が消える。
 #define FATIGUE_SURGE_FADE 0.7f   // 進度100%で突進確率が(1-0.7)=30%に減る (10%→約3%)
 #define FATIGUE_REST_GAIN  20     // 進度100%で休息確率が+この値[%] (18%→約38%)
-#define PUMP_GYRO_FIRE   160.0f   // 上提検出: 角速度[deg/s] 立ち上がり閾値
-#define PUMP_GYRO_ARM    70.0f    // 角速度がこれ未満に戻ると次の上提を再武装
-#define PUMP_REFRACT_MS  130      // 連続検出の不応期 [ms]
 
-// ===== FIGHTING 第2モード「張力保持 (HOLD)」 (前田案, 2026-07-23 Slack) =====
+// ===== FIGHTING「張力保持 (HOLD)」 (前田案, 2026-07-23 Slack。現在唯一の玩法) =====
 //   竿を高く傾けて"保持"している間だけ魚の抵抗=振動を提示し、竿を戻すと
 //   あえて無振動 (糸のテンションが抜けた状態)。傾きをセグメント時間だけ
 //   保持するごとに魚が一段寄る (自責の念バー式の分段進度)。
@@ -130,6 +118,13 @@ static const char* stateName(State s) {
                                   //   周期 5+T が牽引錯覚の有効域 (40Hz±) を
                                   //   大きく外れない範囲に留めること
 
+// ===== 大小魚2条件 (知覚実験, 2026-08-26) =====
+//   難易度非連動 (dc 0, 既定) 時の共通ゲーム構造。段数・段長を両条件で
+//   揃え、「戦闘が長い=大物」という構造手掛かりを排除する。サイズ情報は
+//   触覚 (振幅 sizeFac / 基本周波数 T バイアス / 段完了瞬態の余振τ) のみで運ぶ。
+#define SEG_COUNT_FIXED  4        // 段数 (両条件共通)
+#define SEG_HOLD_FIXED   3200     // 1段の保持時間 [ms] (全長 ~12.8s+回退分)
+
 // ===== 触覚提示のマッピング / Haptic mapping =====
 //   引き感 (高椋ら 2016): 振幅=引きの強さ, パルス間隔T=粗さ(暴れ感)。
 //   ゲーム側の魚の引き driftPerSec と連動させ、サージ時は強く粗い引きにする。
@@ -140,15 +135,6 @@ static const char* stateName(State s) {
 #define PULL_T_SLOW      26       // 弱い引きのパルス間隔 [ms] (周期31ms ≈ 32Hz)
 #define PULL_T_FAST      16       // 強い引きのパルス間隔 [ms] (周期21ms ≈ 48Hz)
 
-// ===== 運動結合 (方案三) / Motion-coupled pseudo force =====
-//   CHI 2025: 非対称振動をユーザ自身の動作に結合すると、感覚減衰により
-//   「拉かれ感」を保ったまま不要な"嗡嗡感"が減る。竿が動いている時だけ
-//   フル振幅を出し、静止中は張力の底ノイズまで落とす。
-#define MC_FLOOR         0.35f    // 静止時の振幅下限 (張力の底ノイズ)
-#define MC_GYRO_FULL     220.0f   // この角速度[deg/s]でゲート全開
-#define MC_ATTACK        0.50f    // ゲート立ち上がり係数 (即応)
-#define MC_RELEASE       0.06f    // ゲート減衰係数 (~300ms で静止レベルへ)
-
 // ===== 釣果テーブル / Catch table =====
 static const char* FISH[] = { "Bass 23cm", "Trout 31cm", "Carp 45cm", "Perch 18cm" };
 static const int   NUM_FISH = sizeof(FISH) / sizeof(FISH[0]);
@@ -158,24 +144,29 @@ State        state        = IDLE;
 uint32_t     stateStart   = 0;       // 現状態に入った時刻
 uint32_t     waitMs       = 0;       // WAITING のランダム待ち時間
 uint32_t     nibbleMs     = 4500;    // NIBBLE のランダム持続時間
-float        rodPos       = ROD_START;      // FIGHTING: マーカー位置 0-100
-uint32_t     holdTime     = 0;              // ゾーン内維持の累計 [ms]
-uint32_t     holdTarget   = 15000;          // 捕獲に必要な維持時間 (enterで乱数)
-uint32_t     escapeTime   = 0;              // ゾーン外の連続時間 [ms]
-float        driftPerSec  = 28.0f;          // 現在の下方減衰速度 [/秒]
-uint32_t     driftReroll  = 0;              // 次に減衰を再抽選する時刻
+uint32_t     holdTime     = 0;              // 進度の累計 [ms] (疲労モデル/CATCH%用)
+uint32_t     holdTarget   = 15000;          // 捕獲に必要な累計 (=段数×段長)
+float        driftPerSec  = 28.0f;          // 魚の引きの現在強度 [/秒] (触覚駆動)
+uint32_t     driftReroll  = 0;              // 次に行動を再抽選する時刻
 uint32_t     fightTick    = 0;              // 前回更新時刻 (dt算出用)
-uint32_t     lastPumpAt   = 0;              // 直近の上提時刻
-bool         pumpArmed    = true;           // 上提検出の再武装フラグ
-uint32_t     pumpFlashAt  = 0;              // 上提演出(閃光)タイマ
+uint32_t     pumpFlashAt  = 0;              // セグメント完了演出(閃光)タイマ
 int          caughtIdx    = 0;
 const char*  failReason   = "";
 int          runCount      = 0;       // 何回目のキャスト (会话编号)
 bool         imuOk        = false;
 
-// ===== FIGHTING 第2モード (張力保持) の状態 =====
-int      fightMode   = 0;             // 0=PUMP(旧・既定) 1=HOLD(張力保持, "fm 1"/BtnB)
-float    fishSize01  = 0.5f;          // 今回の魚サイズ 0..1 (振幅・段数・魚種に反映)
+// ===== FIGHTING (張力保持) と 大小魚2条件の状態 =====
+//   知覚実験 (魚サイズの触覚提示が弁別できるか) 用: BIG/SML の2条件を
+//   IDLE の BtnB / シリアル "fm" で切替。fishSize01 は乱数抽選ではなく
+//   条件の固定水準になる (刺激の再現性)。
+int      sizeMode    = 0;             // 0=SML 1=BIG
+float    sizeSml     = 0.20f;         // SML 条件の fishSize01 ("fs" で調整)
+float    sizeBig     = 0.85f;         // BIG 条件の fishSize01 ("fb" で調整)
+bool     diffCouple  = false;         // true=段数/段長もサイズ連動 (デモ用 "dc 1")。
+                                      //   既定 false: 両条件 4段×3.2s に固定し
+                                      //   「長い戦闘=大物」の構造手掛かりを排除
+bool     expBlind    = false;         // true=画面のサイズ手掛かりを隠す ("bl 1")
+float    fishSize01  = 0.20f;         // 現条件のサイズ値 (触覚写像はこれを参照)
 int      tenSegCount = 4;             // セグメント数 (サイズで 3–5)
 uint32_t tenSegHold  = 3000;          // 1セグメントの必要保持時間 [ms]
 int      tenSegDone  = 0;             // 完了セグメント数
@@ -195,10 +186,8 @@ float hapPullScale   = 1.0f;   // 引き振幅の全体スケール ("pa 0.8")
 int   hapPullTOverride = 0;    // >0 ならパルス間隔T を固定 [ms] ("pt 17", 0=自動)
 int   hapTestMode    = -1;     // -1=ゲーム連動, それ以外は HapticMode を強制 ("t p" 等)
 bool  hapIrregular   = true;   // 不規則性 on/off ("ir 0|1")。off=文献準拠の対照条件
-bool  hapMotionCouple = true;  // 運動結合 on/off ("mc 0|1")。方案三の A/B 用
-bool  hapTug         = true;   // HOLD 引き込み節律 (抗適応) on/off ("ht 0|1")。A/B 用
-bool  hapSizeFreq    = true;   // HOLD 魚サイズ→T バイアス on/off ("hf 0|1")。A/B 用
-float gyroMag        = 0;      // 直近の角速度絶対値 [deg/s] (updateLogic が更新)
+bool  hapTug         = true;   // 引き込み節律 (抗適応) on/off ("ht 0|1")。A/B 用
+bool  hapSizeFreq    = true;   // 魚サイズ→T バイアス on/off ("hf 0|1")。A/B 用
 
 // ===== 電源モニタ (外部給電か内蔵電池かの判定, 充電宝テスト用) =====
 //   StickS3 は 250mAh 内蔵電池を持ち、外部電源が切れても画面は消えない。
@@ -267,9 +256,10 @@ void logState() {
   switch (state) {
     case WAITING:  Serial.printf("  waitMs=%lu", (unsigned long)waitMs); break;
     case NIBBLE:   Serial.printf("  nibbleMs=%lu", (unsigned long)nibbleMs); break;
-    case FIGHTING: Serial.printf("  holdTarget=%lu ms mode=%s size=%.2f seg=%d x %lums",
-                                 (unsigned long)holdTarget, fightMode ? "HOLD" : "PUMP",
-                                 fishSize01, tenSegCount, (unsigned long)tenSegHold); break;
+    case FIGHTING: Serial.printf("  cond=%s size=%.2f seg=%d x %lums blind=%d couple=%d",
+                                 sizeMode ? "BIG" : "SML", fishSize01, tenSegCount,
+                                 (unsigned long)tenSegHold, expBlind ? 1 : 0,
+                                 diffCouple ? 1 : 0); break;
     case CAUGHT:   Serial.printf("  fish=%s", FISH[caughtIdx]);         break;
     case FAILED:   Serial.printf("  reason=%s", failReason);            break;
     default: break;
@@ -287,19 +277,23 @@ void enterState(State s) {
     case WAITING:  waitMs = random(WAIT_MIN_MS, WAIT_MAX_MS + 1); MEL(SFX_PLOP); break; // 扑通
     case NIBBLE:   nibbleMs = random(NIBBLE_MIN_MS, NIBBLE_MAX_MS + 1); break;
     case FIGHTING:                                                                // 叮咚↗
-      rodPos = ROD_START; holdTime = 0; escapeTime = 0;
-      holdTarget  = random(HOLD_TARGET_MIN, HOLD_TARGET_MAX + 1);
+      holdTime = 0;
       driftPerSec = random((int)DRIFT_MIN, (int)DRIFT_MAX + 1);
       driftReroll = millis() + random(DRIFT_REROLL_MIN, DRIFT_REROLL_MAX + 1);
-      fightTick = millis(); lastPumpAt = 0; pumpArmed = true; pumpFlashAt = 0;
-      // 魚サイズ抽選 (両モード共通): 振幅・段数・釣果魚種に反映
-      fishSize01  = random(0, 1001) / 1000.0f;
-      tenSegCount = 3 + (fishSize01 > 0.4f) + (fishSize01 > 0.75f);   // 3–5段
-      tenSegHold  = 2500 + (uint32_t)(1500.0f * fishSize01);          // 2.5–4s/段
+      fightTick = millis(); pumpFlashAt = 0;
+      // 魚サイズ = 現条件の固定水準 (知覚実験: 乱数でなく BIG/SML の2値)
+      fishSize01 = sizeMode ? sizeBig : sizeSml;
+      if (diffCouple) {   // デモ用: 難易度もサイズ連動 (3-5段 × 2.5-4s)
+        tenSegCount = 3 + (fishSize01 > 0.4f) + (fishSize01 > 0.75f);
+        tenSegHold  = 2500 + (uint32_t)(1500.0f * fishSize01);
+      } else {            // 実験既定: 両条件同一構造 → 手掛かりは触覚のみ
+        tenSegCount = SEG_COUNT_FIXED;
+        tenSegHold  = SEG_HOLD_FIXED;
+      }
       tenSegDone = 0; tenSegMs = 0; tenOverMs = 0; tenUnloadMs = 0;
       tenLoaded = false; tenSlipping = false; tiltDeg = 0;
       faX = restGX; faY = restGY; faZ = restGZ;
-      if (fightMode == 1) holdTarget = (uint32_t)tenSegCount * tenSegHold; // 疲労/CATCH%用
+      holdTarget = (uint32_t)tenSegCount * tenSegHold;   // 疲労/CATCH%用
       MEL(SFX_HOOKSET); break;
     case CAUGHT: {                                                                 // 胜利号角
       // 釣果はサイズ抽選と一致させる (手応え=表示)。FISH をサイズ順に参照
@@ -403,8 +397,9 @@ void renderFightTension() {
   textC("FIGHTING!", W / 2, 4, 2, WHITE);
   int hp = (int)(100.0f * holdTime / holdTarget); if (hp > 100) hp = 100;
   char b[32];
+  // 盲検時 ("bl 1") はサイズ表示を伏せる — 被験者の手掛かりは触覚のみ
   snprintf(b, sizeof(b), "CATCH %d%%  [%s]", hp,
-           fishSize01 > 0.75f ? "BIG" : fishSize01 > 0.4f ? "MID" : "SML");
+           expBlind ? "?" : fishSize01 > 0.75f ? "BIG" : fishSize01 > 0.4f ? "MID" : "SML");
   textC(b, W / 2, 26, 1, WHITE);
 
   // 分段バー: 完了=緑 / 現セグメント=充填中 (負荷中は橙・未負荷は暗色) / 残り=黒
@@ -433,7 +428,7 @@ void renderFightTension() {
   textC(hint, W / 2, barY + barH + 8, 1,
         over ? RED : slip ? YELLOW : (tenLoaded ? GREEN : ORANGE));
 
-  if (hapticReady()) {
+  if (hapticReady() && !expBlind) {   // A%/T はサイズを割らせる → 盲検時は非表示
     snprintf(b, sizeof(b), "A:%d%% T:%dms tilt:%d",
              (int)roundf(hapticPullStrength() * 100), hapticPullInterval(), (int)tiltDeg);
     textC(b, W / 2, barY + barH + 20, 1, SKYBLUE);
@@ -458,8 +453,10 @@ void renderScene() {
       textC("Fishing Sim", W / 2, TITLE_Y, 2, WHITE);
       textC("Press BtnA to CAST", W / 2, SUB_Y, 1, CYAN);
       char mb[28];
-      snprintf(mb, sizeof(mb), "mode:%s (BtnB)", fightMode ? "HOLD" : "PUMP");
-      textC(mb, W / 2, SUB_Y + 14, 1, fightMode ? ORANGE : GREENYELLOW);
+      snprintf(mb, sizeof(mb), "fish:%s (BtnB)",
+               expBlind ? "?" : (sizeMode ? "BIG" : "SML"));
+      textC(mb, W / 2, SUB_Y + 14, 1,
+            expBlind ? CYAN : (sizeMode ? ORANGE : GREENYELLOW));
       drawRod(2.0f * sinf(millis() * 0.003f), 2.0f, 0.0f, WHITE);  // 静止(微揺れ)
       break;
     }
@@ -531,64 +528,15 @@ void renderScene() {
       break;
     }
 
-    case FIGHTING: {
-      if (fightMode == 1) { renderFightTension(); break; }   // 第2モード (張力保持)
-      curBg = MAROON; canvas.fillScreen(curBg);
-      textC("FIGHTING!", W / 2, 4, 2, WHITE);
-      int hp = (int)(100.0f * holdTime / holdTarget); if (hp > 100) hp = 100;
-      char b[24]; snprintf(b, sizeof(b), "CATCH %d%%", hp);
-      textC(b, W / 2, 26, 1, WHITE);
-
-      // 横バー (画面長辺いっぱい): 左=0, 右=100 / horizontal gauge along long edge
-      int barX = 8, barW = W - 16;
-      int barY = 56, barH = 40;
-      float rp = rodPos < 0 ? 0 : rodPos > 100 ? 100 : rodPos;
-      canvas.fillRect(barX, barY, barW, barH, BLACK);
-      canvas.drawRect(barX - 1, barY - 1, barW + 2, barH + 2, WHITE);
-
-      int xLo = barX + (int)(barW * ZONE_LO / 100.0f);     // 左の赤線
-      int xHi = barX + (int)(barW * ZONE_HI / 100.0f);     // 右の赤線
-      int mx  = barX + (int)(barW * rp / 100.0f);
-      bool inZone = (rodPos >= ZONE_LO && rodPos <= ZONE_HI);
-
-      // スイートゾーン帯 + 維持の充能(左から緑) / sweet zone + charge fill
-      canvas.fillRect(xLo, barY, xHi - xLo, barH, inZone ? DARKGREEN : NAVY);
-      int bandW = xHi - xLo;
-      int fillW = (int)(bandW * holdTime / holdTarget); if (fillW > bandW) fillW = bandW;
-      canvas.fillRect(xLo, barY, fillW, barH, GREEN);
-      canvas.drawFastVLine(xLo, barY, barH, RED);          // 2本の赤線
-      canvas.drawFastVLine(xHi, barY, barH, RED);
-
-      // マーカー(竿/魚の位置) = 縦の太線 / marker
-      bool flash = (millis() - pumpFlashAt < 90);
-      canvas.fillRect(mx - 3, barY - 4, 6, barH + 8, flash ? WHITE : (inZone ? CYAN : ORANGE));
-
-      // ゾーン外は枠を赤点滅で警告 / out-of-zone warning border
-      if (!inZone) {
-        uint16_t wc = ((millis() / 120) % 2) ? RED : MAROON;
-        canvas.drawRect(barX - 3, barY - 4, barW + 6, barH + 8, wc);
-      }
-
-      // バー下に動作ヒント / action hint under the bar
-      const char* hint = inZone ? "HOLD !" : (rodPos < ZONE_LO ? "PUMP UP ->" : "<- ease off");
-      textC(hint, W / 2, barY + barH + 8, 1, inZone ? GREEN : ORANGE);
-
-      // 触覚刺激の現在値 (振幅% / パルス間隔T) ― 実験時の条件確認用
-      if (hapticReady()) {
-        snprintf(b, sizeof(b), "A:%d%% T:%dms",
-                 (int)roundf(hapticPullStrength() * 100), hapticPullInterval());
-        textC(b, W / 2, barY + barH + 20, 1, SKYBLUE);
-      }
-
-      shakeX = random(-2, 3);
-      if (flash) shakeY = -3;                              // 上提でクッと
+    case FIGHTING:
+      renderFightTension();   // 張力保持 (HOLD)。旧 PUMP 描画は 2026-08-26 廃止
       break;
-    }
 
     case CAUGHT: {
       curBg = DARKGREEN; canvas.fillScreen(curBg);
       textC("CAUGHT!", W / 2, TITLE_Y, 2, WHITE);
-      textC(FISH[caughtIdx], W / 2, SUB_Y, 1, YELLOW);
+      // 盲検時は魚種(=サイズの答え)を伏せる。回答聴取後に口頭でデブリーフ
+      textC(expBlind ? "? ? ?" : FISH[caughtIdx], W / 2, SUB_Y, 1, YELLOW);
       drawFish(W / 2, ZONE_Y + ZONE_H / 2 + 2, 18, SILVER);
       break;
     }
@@ -623,15 +571,14 @@ void updateRestPose() {
   restGZ += (az - restGZ) * 0.03f;
 }
 
-// FIGHTING (fightMode=1) の1フレーム更新。
+// FIGHTING (張力保持) の1フレーム更新。
 //  ・傾き = 現在の重力ベクトルと基線の夾角 (取付方向フリー)
 //  ・保持で現セグメントが充填 → 完了で魚が一段寄る。全段で CAUGHT
 //  ・竿を戻すと進度が少し戻される + 未負荷が続くと魚が逃げる
 //  ・過傾 (強引すぎ, 前田図の×) が続くとラインブレイク
 void tensionFightUpdate(uint32_t now, uint32_t dt) {
-  float ax = 0, ay = 0, az = 1, gx = 0, gy = 0, gz = 0;
-  if (imuOk) { M5.Imu.getAccel(&ax, &ay, &az); M5.Imu.getGyro(&gx, &gy, &gz); }
-  gyroMag = sqrtf(gx * gx + gy * gy + gz * gz);
+  float ax = 0, ay = 0, az = 1;
+  if (imuOk) M5.Imu.getAccel(&ax, &ay, &az);
   faX += (ax - faX) * 0.15f;                       // 揺れ除去の低域通過
   faY += (ay - faY) * 0.15f;
   faZ += (az - faZ) * 0.15f;
@@ -707,10 +654,13 @@ void updateLogic() {
 
     case IDLE:
       if (M5.BtnA.wasPressed()) { runCount++; enterState(CASTING); }
-      if (M5.BtnB.wasPressed()) {                  // 戦闘モード切替 (PUMP⇔HOLD)
-        fightMode ^= 1;
-        beep(fightMode ? 1400 : 800, 60);
-        Serial.printf("  fight mode = %s\n", fightMode ? "HOLD (tension)" : "PUMP (classic)");
+      if (M5.BtnB.wasPressed()) {                  // 大小魚条件切替 (SML⇔BIG)
+        sizeMode ^= 1;
+        fishSize01 = sizeMode ? sizeBig : sizeSml;
+        // 盲検時は音でも条件を割らせない (同一音)。通常は 大=低音/小=高音
+        beep(expBlind ? 1000 : (sizeMode ? 500 : 1600), 60);
+        Serial.printf("  fish condition = %s (size01=%.2f)\n",
+                      sizeMode ? "BIG" : "SML", fishSize01);
       }
       break;
 
@@ -777,53 +727,9 @@ void updateLogic() {
         }
       }
 
-      // ＝＝ 第2モード (張力保持) はここで分岐。魚行動の再抽選は共通
-      //     (driftPerSec が触覚の振幅テクスチャ/イベントを駆動し続ける) ＝＝
-      if (fightMode == 1) { tensionFightUpdate(now, dt); break; }
-
-      rodPos -= driftPerSec * dt / 1000.0f;              // マーカーは下へ
-
-      // --- 上提(煽り)検出: 角速度スパイク + ヒステリシス + 不応期 ---
-      float gx = 0, gy = 0, gz = 0;
-      if (imuOk) M5.Imu.getGyro(&gx, &gy, &gz);
-      float gmag = sqrtf(gx * gx + gy * gy + gz * gz);   // [deg/s]
-      gyroMag = gmag;                                    // 触覚の運動結合ゲート用
-      if (gmag < PUMP_GYRO_ARM) pumpArmed = true;        // 竿が戻ったら再武装
-      bool pumped = false;
-      if (pumpArmed && gmag > PUMP_GYRO_FIRE && now - lastPumpAt > PUMP_REFRACT_MS) {
-        pumped = true; pumpArmed = false;
-      }
-      if (M5.BtnA.wasPressed()) pumped = true;           // バックアップ(展示保険)
-      if (pumped) { rodPos += PUMP_RISE; lastPumpAt = now; pumpFlashAt = now; }
-
-      if (rodPos > 100) rodPos = 100;
-      if (rodPos < 0)   rodPos = 0;
-
-      // --- ゾーン判定 & タイマ ---
-      uint32_t el = now - stateStart;
-      bool inZone = (rodPos >= ZONE_LO && rodPos <= ZONE_HI);
-      if (inZone) {
-        holdTime += dt; escapeTime = 0;
-        if (pumped && el > 350) {                        // 維持が進むほど高音=爽快
-          int f = 900 + (int)(900.0f * holdTime / holdTarget);
-          if (f > 1900) f = 1900;
-          beep(f, 20);
-        }
-      } else {
-        escapeTime += dt;
-        if (pumped && el > 350) beep(520, 22);           // ゾーン外の上提は鈍い音
-        if (el > 350 && now - sfxTick >= 220) {          // 逃走警告
-          beep(330, 55); sfxTick = now;
-        }
-      }
-
-      // --- 判定 ---
-      if (holdTime >= holdTarget) {
-        enterState(CAUGHT);
-      } else if (rodPos <= 0.0f || escapeTime >= ESCAPE_LIMIT) {
-        Serial.printf("    >> FISH RAN OFF (escapeTime=%lu ms)\n", (unsigned long)escapeTime);
-        failReason = "Ran off!"; enterState(FAILED);
-      }
+      // 魚行動の再抽選のあと張力保持の更新へ
+      // (driftPerSec が触覚の振幅テクスチャ/イベントを駆動し続ける)
+      tensionFightUpdate(now, dt);
       break;
     }
 
@@ -840,7 +746,7 @@ void updateLogic() {
 // =============================================================================
 //  触覚提示の更新 / Haptic update  (研究計画書 3.2-3.3 + IMPROVEMENT_PROPOSAL)
 //   NIBBLE/BITE → アタリ (タップイベント列, 10+23Hz 包絡の AM),
-//   FIGHTING    → 非対称矩形波 (引き感) + 運動結合ゲート + slack/サージ瞬態
+//   FIGHTING    → 非対称矩形波 (引き感) + 傾き張力門控 + slack/サージ瞬態
 // =============================================================================
 void updateHaptics() {
   float strength;
@@ -854,44 +760,22 @@ void updateHaptics() {
     if (s01 < 0.12f) s01 = 0.12f;                    // 休息中もライン張力は残る
     if (s01 > 1.0f)  s01 = 1.0f;
 
-    if (state == FIGHTING && fightMode == 1) {
-      // ＝＝ HOLD モード: 傾き=張力が門控そのもの (前田案) ＝＝
-      // 竿を高く保持するほど張力大 (×0.85–1.15)。未負荷時はモード側で無振動に
-      // なるので、運動結合(mc)は適用しない (傾き門控が action-coupling の代替)。
+    // 魚サイズ→振幅 (高椋ら2016: 振幅・周波数で魚サイズの印象を変調可能)。
+    // 台架試験 ("t p") でも BIG/SML の条件差がそのまま出るよう、ゲーム外でも掛ける
+    float sizeFac = TEN_AMP_MIN + (1.0f - TEN_AMP_MIN) * fishSize01;
+
+    if (state == FIGHTING) {
+      // ＝＝ 張力保持 (前田案): 傾き=張力が門控そのもの ＝＝
+      // 竿を高く保持するほど張力大 (×0.85–1.15)。未負荷時はモード側で無振動
       float t01 = (tiltDeg - TEN_TILT_ON) / (TEN_TILT_FULL - TEN_TILT_ON);
       if (t01 < 0) t01 = 0; if (t01 > 1) t01 = 1;
       float loadFac = 0.85f + 0.30f * t01;
-      // 魚サイズ→振幅 (高椋ら2016: 振幅・周波数で魚サイズの印象を変調可能)
-      float sizeFac = TEN_AMP_MIN + (1.0f - TEN_AMP_MIN) * fishSize01;
       // 抗適応の漸増: セグメント充填に沿って +18% まで振幅を上げ、
       // 触覚適応 (連続刺激で主観強度が数秒で低下) を補償する
       float adaptFac = 1.0f + TEN_ADAPT_GAIN * ((float)tenSegMs / (float)tenSegHold);
       strength = s01 * loadFac * sizeFac * adaptFac * hapPullScale;
     } else {
-      // ＝＝ PUMP モード (旧) ＝＝
-      // [張力層1] 竿の姿勢: 竿を立てている(マーカー高)ほど張力大 ×0.85-1.15
-      float posFac = 0.85f + 0.30f * (rodPos / 100.0f);
-
-      // [張力層2] 上提の瞬間: pump 直後 400ms は最大+35%の張力スパイク
-      uint32_t dtP = millis() - lastPumpAt;
-      float pumpFac = (state == FIGHTING && lastPumpAt != 0 && dtP < 400)
-                    ? 1.0f + 0.35f * (1.0f - dtP / 400.0f) : 1.0f;
-
-      // [運動結合層] (方案三, CHI 2025): 竿が動いている間だけフル振幅、
-      //   静止中は MC_FLOOR まで減衰 → 感覚減衰により"嗡嗡感"を抑えつつ
-      //   引かれ感を残す。立ち上がりは即応、戻りは ~300ms でゆっくり。
-      static float mcGate = 0;
-      float mcFac = 1.0f;
-      if (hapMotionCouple && state == FIGHTING) {
-        float g01 = gyroMag / MC_GYRO_FULL;
-        if (g01 > 1) g01 = 1;
-        mcGate += (g01 - mcGate) * (g01 > mcGate ? MC_ATTACK : MC_RELEASE);
-        mcFac = MC_FLOOR + (1.0f - MC_FLOOR) * mcGate;
-      } else {
-        mcGate = 0;
-      }
-
-      strength = s01 * posFac * pumpFac * mcFac * hapPullScale;
+      strength = s01 * sizeFac * hapPullScale;   // 台架試験用のベース刺激
     }
 
     // パルス間隔T: 引きが強いほど粗く(22→12ms)。休息中は細かく弱い振動。
@@ -900,9 +784,10 @@ void updateHaptics() {
     Tms = hapPullTOverride > 0
         ? hapPullTOverride
         : (int)roundf(PULL_T_SLOW - k * (PULL_T_SLOW - PULL_T_FAST));
-    // HOLD: 魚サイズ→基本周波数バイアス。大きい魚ほど T 長 (低周波=重い),
+    // 魚サイズ→基本周波数バイアス。大きい魚ほど T 長 (低周波=重い),
     // 小さい魚ほど T 短 (高周波=軽快)。"pt" で T 固定中は適用しない。
-    if (state == FIGHTING && fightMode == 1 && hapSizeFreq && hapPullTOverride <= 0)
+    // 台架試験でも掛かる (振幅と同じ理由)
+    if (hapSizeFreq && hapPullTOverride <= 0)
       Tms += TEN_T_BIAS_SML + (int)roundf((TEN_T_BIAS_BIG - TEN_T_BIAS_SML) * fishSize01);
   } else {
     // ＝＝ 規則モード(対照条件): 高椋ら2016と同じ一定振幅・一定間隔 ＝＝
@@ -911,9 +796,10 @@ void updateHaptics() {
   }
   hapticSetIrregular(hapIrregular);
   hapticSetPull(strength, Tms);
-  // HOLD 中のみ: 引き込み節律 (抗適応) と ドラッグ滑り (クリック列+張力ダック)
-  hapticSetTug(hapTug && state == FIGHTING && fightMode == 1);
-  hapticSetSlip(state == FIGHTING && fightMode == 1 && tenLoaded && tenSlipping);
+  // 引き込み節律 (抗適応) は実戦と台架試験の両方で有効 (刺激を一致させる)。
+  // ドラッグ滑りは実戦の過傾時のみ
+  hapticSetTug(hapTug && (state == FIGHTING || hapTestMode == HAPTIC_PULL));
+  hapticSetSlip(state == FIGHTING && tenLoaded && tenSlipping);
 
   if (hapTestMode >= 0) {                    // シリアルからの強制モード (ベンチ試験)
     hapticSetMode((HapticMode)hapTestMode);
@@ -923,9 +809,9 @@ void updateHaptics() {
     case NIBBLE:   hapticSetMode(HAPTIC_NIBBLE); break;
     case BITE:     hapticSetMode(HAPTIC_BITE);   break;
     case FIGHTING:
-      // HOLD モード: 竿を戻している間は"あえて無振動" (糸のテンション無し)。
+      // 竿を戻している間は"あえて無振動" (糸のテンション無し)。
       // 引かれている(保持中)タイミングだけ振動する — 前田案の核心。
-      hapticSetMode((fightMode == 1 && !tenLoaded) ? HAPTIC_OFF : HAPTIC_PULL);
+      hapticSetMode(tenLoaded ? HAPTIC_PULL : HAPTIC_OFF);
       break;
     case IDLE:
     case CAUGHT:
@@ -944,8 +830,11 @@ void updateHaptics() {
 //    t 0|n|b|p  : 触覚モードを強制 (off/nibble/bite/pull)   t g : ゲーム連動へ戻す
 //    pa <0-1>   : 引き振幅スケール      pt <ms> : パルス間隔T固定 (pt 0 で自動)
 //    na <0-1>   : アタリ振幅            fc <Hz> : AMキャリア周波数 (共振点スイープ用)
-//    tt <ms>    : タップ余振τ           mc 0|1  : 運動結合 on/off
-//    fm 0|1     : 戦闘モード 0=PUMP(旧) 1=HOLD(張力保持, 前田案)。IDLE の BtnB でも切替
+//    tt <ms>    : タップ余振τ
+//    fm 0|1     : 魚サイズ条件 0=SML 1=BIG (IDLE の BtnB でも切替)
+//    fs <0-1>   : SML 条件のサイズ値 (既定0.20)   fb <0-1> : BIG 条件 (既定0.85)
+//    bl 0|1     : 盲検モード。画面/切替音からサイズ手掛かりを消す (知覚実験用)
+//    dc 0|1     : 難易度連動。1=段数/段長もサイズ連動 (デモ用)。既定0=両条件同一
 //    wa <0-1>   : 渚(待機の環境触覚)の振幅。0=無効。既定0.35
 //    wi <sec>   : 渚の平均間隔 [秒]。既定45s
 //    wk <0-1>   : 底流(無感の保活トーン)振幅。既定0.35   wf <Hz> : 同周波数 (既定28)
@@ -975,15 +864,31 @@ void handleCommand(char* line) {
       if (line[1] == 'c') {
         hapticSetCarrier(atof(arg));
         Serial.printf("  carrier = %.1f Hz\n", hapticCarrier());
-      } else if (line[1] == 'm') {             // "fm 0|1" 戦闘モード切替
-        fightMode = (atoi(arg) != 0) ? 1 : 0;
-        Serial.printf("  fight mode = %s\n", fightMode ? "HOLD (tension)" : "PUMP (classic)");
+      } else if (line[1] == 'm') {             // "fm 0|1" 魚サイズ条件
+        sizeMode = (atoi(arg) != 0) ? 1 : 0;
+        fishSize01 = sizeMode ? sizeBig : sizeSml;
+        Serial.printf("  fish condition = %s (size01=%.2f)\n",
+                      sizeMode ? "BIG" : "SML", fishSize01);
+      } else if (line[1] == 's' || line[1] == 'b') {   // "fs/fb <0-1>" 条件の水準値
+        float v = atof(arg);
+        if (v < 0) v = 0; if (v > 1) v = 1;
+        if (line[1] == 's') sizeSml = v; else sizeBig = v;
+        fishSize01 = sizeMode ? sizeBig : sizeSml;
+        Serial.printf("  size levels: SML=%.2f BIG=%.2f (current=%s)\n",
+                      sizeSml, sizeBig, sizeMode ? "BIG" : "SML");
       }
       break;
-    case 'm':
-      if (line[1] == 'c') {
-        hapMotionCouple = (atoi(arg) != 0);
-        Serial.printf("  motion coupling = %s\n", hapMotionCouple ? "ON" : "OFF");
+    case 'b':
+      if (line[1] == 'l') {                    // "bl 0|1" 盲検モード
+        expBlind = (atoi(arg) != 0);
+        Serial.printf("  blind mode = %s\n", expBlind ? "ON (size cues hidden)" : "OFF");
+      }
+      break;
+    case 'd':
+      if (line[1] == 'c') {                    // "dc 0|1" 難易度のサイズ連動
+        diffCouple = (atoi(arg) != 0);
+        Serial.printf("  difficulty couple = %s\n",
+                      diffCouple ? "ON (demo: segs follow size)" : "OFF (matched 4x3.2s)");
       }
       break;
     case 'p':
@@ -1037,8 +942,8 @@ void handleCommand(char* line) {
       break;
     default:
       Serial.println("  cmds: t 0|n|b|p|g / pa <0-1> / pt <ms> / na <0-1> / ir 0|1"
-                     " / fc <Hz> / tt <ms> / mc 0|1 / fm 0|1 / wa <0-1>"
-                     " / ht 0|1 / hf 0|1 / hd <deg>");
+                     " / fc <Hz> / tt <ms> / wa <0-1> / ht 0|1 / hf 0|1 / hd <deg>"
+                     " / fm 0|1 / fs|fb <0-1> / bl 0|1 / dc 0|1");
   }
 }
 
@@ -1099,8 +1004,8 @@ void setup() {
                 imuOk ? "ok" : "N/A", speakerOk ? "ok" : "N/A",
                 hapOk ? "ok" : "N/A");
   Serial.println("serial cmds: t 0|n|b|p|g / pa <0-1> / pt <ms> / na <0-1> / ir 0|1"
-                 " / fc <Hz> / tt <ms> / mc 0|1 / fm 0|1 / wa <0-1>"
-                 " / ht 0|1 / hf 0|1 / hd <deg>");
+                 " / fc <Hz> / tt <ms> / wa <0-1> / ht 0|1 / hf 0|1 / hd <deg>"
+                 " / fm 0|1 / fs|fb <0-1> / bl 0|1 / dc 0|1");
 
   enterState(IDLE);
 }
