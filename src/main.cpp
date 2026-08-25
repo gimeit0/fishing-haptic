@@ -209,6 +209,13 @@ bool     pwrChg  = false;   // M5.Power.isCharging()
 int      pwrLvl  = -1;      // 残量 [%]
 int      pwrCur  = 0;       // 電池電流 [mA] (正=充電, 負=放電)
 
+// ===== 前回リセット原因 (brownout 診断用, 2026-08-26) =====
+//   BIG 条件で黒屏再起動する問題の切り分け: PC につながず単体でテストしても
+//   再起動の「原因」が読めるよう、esp_reset_reason() を IDLE 画面に常時表示。
+//   BROWNOUT = 供電垂下 (赤表示) / PANIC・WDT = ファーム不具合 (要報告)。
+const char* rstName  = "?";
+bool        rstIsBrownout = false;
+
 // 描画ターゲット (オフスクリーン) / Off-screen render target
 M5Canvas canvas(&M5.Display);
 bool     useSprite = false;
@@ -469,6 +476,9 @@ void renderScene() {
       textC(mb, W / 2, SUB_Y + 14, 1,
             expBlind ? CYAN : (sizeMode ? ORANGE : GREENYELLOW));
       drawRod(2.0f * sinf(millis() * 0.003f), 2.0f, 0.0f, WHITE);  // 静止(微揺れ)
+      // 前回リセット原因 (brownout 切り分け用)。POWERON/SW 以外は目立たせる
+      snprintf(mb, sizeof(mb), "rst:%s", rstName);
+      textC(mb, W / 2, SUB_Y + 28, 1, rstIsBrownout ? RED : DARKGREY);
       break;
     }
 
@@ -991,6 +1001,18 @@ void setup() {
   M5.begin(cfg);
   Serial.begin(115200);
 
+  // 前回リセット原因を取得 (IDLE 画面に常時表示。brownout 診断はこれを見る)
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:  rstName = "POWERON";  break;
+    case ESP_RST_SW:       rstName = "SW";       break;
+    case ESP_RST_PANIC:    rstName = "PANIC!";   break;
+    case ESP_RST_INT_WDT:  rstName = "INT_WDT!"; break;
+    case ESP_RST_TASK_WDT: rstName = "TASK_WDT!";break;
+    case ESP_RST_WDT:      rstName = "WDT!";     break;
+    case ESP_RST_BROWNOUT: rstName = "BROWNOUT"; rstIsBrownout = true; break;
+    default:               rstName = "OTHER";    break;
+  }
+
   M5.Display.setRotation(0);                // 逆时针 90° (旧: 1)
   M5.Display.setBrightness(255);            // 最亮 / max brightness
   W = M5.Display.width();
@@ -1025,6 +1047,7 @@ void setup() {
   bool hapOk = hapticInit();
 
   Serial.println("=== Fishing Experience Simulator + Haptics ===");
+  Serial.printf("Reset reason: %s\n", rstName);
   Serial.printf("Display %dx%d  sprite=%s  IMU=%s  SPK=%s  I2S=%s\n",
                 W, H, useSprite ? "on" : "off",
                 imuOk ? "ok" : "N/A", speakerOk ? "ok" : "N/A",
